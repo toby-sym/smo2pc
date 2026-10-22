@@ -158,7 +158,7 @@ static inline void v_f1v(V128 *d, const V128 *pn, int op, int dbl, int n) {
     *d = r;
 }
 
-enum { I_ADD, I_SUB, I_MUL, I_CMEQ, I_CMGT, I_CMHI, I_CMGE, I_CMHS, I_CMTST, I_SQADD, I_UQADD, I_SQSUB, I_UQSUB, I_MLA };
+enum { I_ADD, I_SUB, I_MUL, I_CMEQ, I_CMGT, I_CMHI, I_CMGE, I_CMHS, I_CMTST, I_SQADD, I_UQADD, I_SQSUB, I_UQSUB, I_MLA, I_ADDP };
 
 /* saturation of an exact result to a signed / unsigned element of size sz (FPSR.QC is not modelled; the lifter
  * reads FPSR as 0) */
@@ -178,6 +178,15 @@ static inline uint64_t v_sat_u(__int128 v, int sz) {
 static inline void v_i3v(V128 *d, const V128 *pn, const V128 *pm, int op, int sz, int n) {
     V128 a = *pn, b = *pm, acc = *d, r;
     r.d[0] = 0; r.d[1] = 0;
+    if (op == I_ADDP) {
+        /* [doc] Arm Instruction Set Reference Guide D6.5: pair adjacent lanes in n, then m. */
+        for (int i = 0; i < n / 2; i++) {
+            vset(&r, sz, i, vget(&a, sz, 2 * i) + vget(&a, sz, 2 * i + 1));
+            vset(&r, sz, i + n / 2, vget(&b, sz, 2 * i) + vget(&b, sz, 2 * i + 1));
+        }
+        *d = r;
+        return;
+    }
     uint64_t ones = sz == 3 ? ~0ull : ((1ull << (8 << sz)) - 1);
     for (int i = 0; i < n; i++) {
         uint64_t x = vget(&a, sz, i), y = vget(&b, sz, i), z = 0;

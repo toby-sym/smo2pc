@@ -791,8 +791,8 @@ class Fn:
                       (0, 0x06): 'I_CMGT', (1, 0x06): 'I_CMHI', (0, 0x07): 'I_CMGE', (1, 0x07): 'I_CMHS',
                       # SMO additions (audio DSP in the SDK): saturating add / subtract, multiply-accumulate (7.3.2)
                       (0, 0x01): 'I_SQADD', (1, 0x01): 'I_UQADD', (0, 0x05): 'I_SQSUB', (1, 0x05): 'I_UQSUB',
-                      (0, 0x12): 'I_MLA'}.get((u, opc))
-                if op is None or (op == 'I_MLA' and size == 3):
+                      (0, 0x12): 'I_MLA', (0, 0x17): 'I_ADDP'}.get((u, opc))
+                if op is None or (op == 'I_MLA' and size == 3) or (op == 'I_ADDP' and size == 3 and not q):
                     raise Unimpl('simd-i3')
                 return 'v_i3v(%s, %s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), op, size, icount(size))
             if bits(w, 20, 17) == 0 and bits(w, 11, 10) == 2:    # two registers, miscellaneous
@@ -810,6 +810,9 @@ class Fn:
                 if op is None or (op in ('I1_NOT', 'I1_CNT') and size):
                     raise Unimpl('simd-misc')
                 return 'v_i1v(%s, %s, %s, %d, %d);' % (V(rd), V(rn), op, size, icount(size))
+            if scalar and not u and bits(w, 20, 17) == 8 and bits(w, 16, 12) == 0x0d and bits(w, 11, 10) == 2:  # ADDP Dd, Vn.2D
+                # [doc] Arm Instruction Set Reference Guide D5.4: add the two source lanes into scalar Dd.
+                return '{ uint64_t t = c->v[%d].d[0] + c->v[%d].d[1]; vzero(&c->v[%d]); c->v[%d].d[0] = t; }' % (rn, rn, rd, rd)
             if scalar and u and bits(w, 20, 17) == 8 and bits(w, 16, 12) == 0x0d and bits(w, 11, 10) == 2:
                 f, ft = ('df', 'double') if sz else ('f', 'float')   # faddp scalar
                 return '{ %s t = c->v[%d].%s[0] + c->v[%d].%s[1]; vzero(%s); c->v[%d].%s[0] = t; }' % (ft, rn, f, rn, f, V(rd), rd, f)
