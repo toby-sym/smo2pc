@@ -1200,11 +1200,14 @@ def _worker_scan(entries):
     env = _worker_env
     env.wanted = collections.OrderedDict()
     total = bad = 0
+    examples = []
     for a in entries:
         _, n, b = lift_function(env, a)
         total += n
         bad += len(b)
-    return total, bad, list(env.wanted)
+        if len(examples) < 200:
+            examples.extend(b[:200 - len(examples)])
+    return total, bad, list(env.wanted), examples
 
 
 def _worker_write(job):
@@ -1239,15 +1242,18 @@ def cmd_full2(outdir, jobs):
     known = set(starts)
     pending = list(starts)
     all_funcs = []
+    bad_examples = []
     total = bad = 0
     with multiprocessing.Pool(jobs, _worker_init, (starts,)) as pool:
         while pending:
             pending.sort()
             parts = [pending[i:i + 400] for i in range(0, len(pending), 400)]
             new = set()
-            for n, b, wanted in pool.imap_unordered(_worker_scan, parts):
+            for n, b, wanted, examples in pool.imap_unordered(_worker_scan, parts):
                 total += n
                 bad += b
+                if len(bad_examples) < 200:
+                    bad_examples.extend(examples[:200 - len(bad_examples)])
                 new.update(w for w in wanted if w not in known and BASE <= w < BASE + TEXT_SIZE)
             all_funcs += pending
             print('discovery: %d functions, %d extra branch targets  (%.0fs)' % (len(pending), len(new), time.time() - t0))
@@ -1286,6 +1292,18 @@ def cmd_full2(outdir, jobs):
             os.remove(os.path.join(outdir, n))
     print('functions: %d   files: %d (%d rewritten)   instructions: %d   not translated: %d   (%.0fs)'
           % (len(all_funcs), len(files), changed, total, bad, time.time() - t0))
+    report = os.path.join(outdir, 'cpu_coverage.txt')
+    with open(report, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('AArch64 translation coverage for lifted main functions\n')
+        f.write('Functions: %d\nInstructions: %d\nUntranslated: %d\n' % (len(all_funcs), total, bad))
+        f.write('Translated: %d (%.4f%%)\n' % (total - bad, 100.0 * (total - bad) / total if total else 100.0))
+        if bad_examples:
+            f.write('\nUntranslated examples (up to 200):\n')
+            for pc, insn, reason in sorted(set(bad_examples)):
+                f.write('0x%x  0x%08x  %s\n' % (pc, insn, reason))
+    print('CPU coverage report: %s' % report)
+    if bad:
+        raise SystemExit('CPU coverage gate failed: %d instruction(s) are not translated; see cpu_coverage.txt' % bad)
 
 
 def cmd_cover():

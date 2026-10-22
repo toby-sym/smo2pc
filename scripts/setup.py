@@ -30,6 +30,7 @@ import argparse
 import glob
 import importlib
 import os
+import re
 import subprocess
 import sys
 
@@ -79,6 +80,37 @@ def need_dump(a):
     return ['--dump', a.dump]
 
 
+def report_zero(path, pattern, sources=()):
+    try:
+        report_mtime = os.path.getmtime(path)
+        with open(path, encoding='utf-8') as report:
+            text = report.read()
+    except OSError:
+        return False
+    for source in sources:
+        try:
+            if os.path.getmtime(source) > report_mtime:
+                return False
+        except OSError:
+            return False
+    match = re.search(pattern, text, re.MULTILINE)
+    return bool(match and int(match.group(1)) == 0)
+
+
+def cpu_lift_complete():
+    return (exists('lift', 'main', 'table.c') and
+            report_zero(T.build('lift', 'main', 'cpu_coverage.txt'), r'^Untranslated: (\d+)$',
+                        [tool('lifter', 'recomp.py'), T.elf('main'), T.build('functions', 'main_functions.tsv')]))
+
+
+def sdk_lift_complete():
+    return (exists('gen', 'sdklift_gen.c') and
+            report_zero(T.build('gen', 'sdklift_report.txt'), r'^roots .*? untranslated (\d+),',
+                        [tool('lifter', 'sdklift.py'), tool('lifter', 'recomp.py'),
+                         tool('lifter', 'sdklift_rules.txt'), T.elf('sdk'),
+                         T.build('functions', 'sdk_functions.tsv')]))
+
+
 # name, what it makes (for --status; in the build folder), done test (None: always runs), commands
 STEPS = [
     ('deps', 'tools found', None, None),
@@ -86,12 +118,12 @@ STEPS = [
      lambda a: [[PY, tool('extract', 'extract.py')] + need_dump(a)]),
     ('functions', 'functions', lambda: exists('functions', 'main_functions.tsv'),
      lambda a: [[PY, tool('extract', 'functions.py')]]),
-    ('lift', 'lift/main', lambda: exists('lift', 'main', 'table.c'),
+    ('lift', 'lift/main', cpu_lift_complete,
      lambda a: [[PY, tool('lifter', 'recomp.py'), 'full']]),
     ('compile', 'obj/main', None, lambda a: [[PY, tool('lifter', 'build_main.py'), str(a.jobs)]]),
     ('tables', 'gen', None,
      lambda a: [[PY, tool('lifter', 'gen_tables.py')], [PY, tool('lifter', 'gen_sdktest.py')]]),
-    ('sdk', 'gen/sdklift_gen.c', lambda: exists('gen', 'sdklift_report.txt'),
+    ('sdk', 'gen/sdklift_gen.c', sdk_lift_complete,
      lambda a: [[PY, tool('lifter', 'sdklift.py'), 'gen']]),
     ('link', 'bin/smo_native.exe', None, lambda a: [[PY, tool('lifter', 'build_exe.py')]]),
     ('check', 'difftest + linkcheck', None,

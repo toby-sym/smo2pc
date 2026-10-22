@@ -397,6 +397,8 @@ def main():
           % (len(root_names), len(done), total, len(bad), len(svc), len(env.host_names),
              sum(1 for n in env.host_names if n not in GAME_IMPORTS), len(ctors), [k for k, _ in ctors]))
     print('report: %s' % os.path.join(GEN, 'sdklift_report.txt'))
+    if bad:
+        raise SystemExit('CPU coverage gate failed: %d SDK instruction(s) are not translated; see sdklift_report.txt' % len(bad))
 
 
 if __name__ == '__main__':

@@ -76,8 +76,11 @@ link       host runtime + game library -> build/bin/smo_native.exe              
 check      differential test against Unicorn, link check (on demand)        tools/lifter/difftest.py, linkcheck.py
 ```
 
-A step whose output exists is skipped, so an interrupted setup resumes where it stopped. `compile`, `tables` and `link`
-always run and only rebuild what changed. `--status` shows what is done, `--only <step>` runs one step, `--redo <step>`
+A step whose output exists is skipped, so an interrupted setup resumes where it stopped. The `lift` step stops before
+C compilation, and the `sdk` step stops before final linking, if an instruction in the selected game or SDK code has
+no translation; inspect `build\lift\main\cpu_coverage.txt` or `build\gen\sdklift_report.txt` and add support. This keeps
+unknown CPU instructions from being shipped as runtime traps. `compile`, `tables` and `link` always run and only rebuild
+what changed. `--status` shows what is done, `--only <step>` runs one step, `--redo <step>`
 repeats one, `--from <step>` repeats it and everything after it, `--check` adds the check step (minutes). After a change
 to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runtime, `--only link` is enough.
 
