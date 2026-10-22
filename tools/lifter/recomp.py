@@ -327,6 +327,8 @@ class Fn:
                 return '', '%s + (uint64_t)%dLL' % (base, imm), ''
             if mode == 1:
                 return '', base, '%s += (uint64_t)%dLL;' % (base, imm)
+            if mode == 2:                               # LDTR / STTR: unprivileged access, same user mapping here
+                return '', '%s + (uint64_t)%dLL' % (base, imm), ''
             if mode == 3:
                 return '%s += (uint64_t)%dLL;' % (base, imm), base, ''
             raise Unimpl('ldst-unpriv')
@@ -406,16 +408,27 @@ class Fn:
             return SET(rt, 1, ['rd32(%s)', 'rd64(%s)', '(int64_t)(int32_t)rd32(%s)'][opc] % a)
         if bits(w, 29, 24) == 8 and not v:               # exclusive / ordered
             size, o2, load, o1 = bits(w, 31, 30), bits(w, 23, 23), bits(w, 22, 22), bits(w, 21, 21)
-            if o1:
-                raise Unimpl('excl-pair')
-            nb = 8 << size
             rs = bits(w, 20, 16)
+            if o1:
+                if o2 or size < 2:
+                    raise Unimpl('excl-pair')
+                rt2 = bits(w, 14, 10)
+                if load:
+                    if size == 2:
+                        body = 'uint32_t t1, t2; ldxp32(c, a, &t1, &t2); %s %s' % (SET(rt, 0, 't1'), SET(rt2, 0, 't2'))
+                    else:
+                        body = 'uint64_t t1, t2; ldxp64(c, a, &t1, &t2); %s %s' % (SET(rt, 1, 't1'), SET(rt2, 1, 't2'))
+                    return '{ uint64_t a = %s; %s }' % (XS(rn), body)
+                if size == 2:
+                    return SET(rs, 0, 'stxp32(c, %s, %s, %s)' % (XS(rn), W(rt), W(rt2)))
+                return SET(rs, 0, 'stxp64(c, %s, %s, %s)' % (XS(rn), X(rt), X(rt2)))
+            nb = 8 << size
             if o2:                                       # ldar / stlr: ordered, not exclusive
                 if load:
                     return SET(rt, 1, 'rd%d(%s)' % (nb, XS(rn)))
                 return 'wr%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
             if load:                                     # ldxr / ldaxr: remember address and value
-                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_val = rd%d(a); %s }' % (XS(rn), nb, SET(rt, 1, 'c->ex_val'))
+                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_size = %d; c->ex_val = rd%d(a); %s }' % (XS(rn), nb, nb, SET(rt, 1, 'c->ex_val'))
             # stxr / stlxr: succeeds only if the value is still the one loaded (compare-and-swap)
             return SET(rs, 0, 'stx%d(c, %s, %s)' % (nb, XS(rn), R(rt, size == 3)))
         if bits(w, 31, 31) == 0 and bits(w, 29, 24) in (0x0c, 0x0d):   # AdvSIMD structure load/store
