@@ -20,6 +20,8 @@ scripted runs further through the game are welcome. Three rules apply to every c
   its code, its lists or its files into the repository.
 - [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp) (GPL-3.0) is the base of the runtime and the lifter; its code
   is adapted under its licence, and files adapted from it say so in their header.
+- [hactool](https://github.com/SciresM/hactool) (ISC) is run as a separate local tool for encrypted NSP/XCI imports;
+  it is downloaded into ignored `deps/`, never copied into this repository, and no keys are supplied by CI.
 - Emulator sources and documentation (yuzu/suyu, Ryujinx) consulted for console behaviour are cited where used; copy
   nothing their licences do not allow.
 

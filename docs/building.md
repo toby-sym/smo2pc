@@ -7,8 +7,9 @@ by git). One script does all of it, in steps that resume where they stopped:
 .venv\Scripts\python scripts\setup.py --dump "<folder of your dump>"
 ```
 
-No console keys and no firmware are needed: the dump's files are already decrypted by your console, and the build only
-converts and reads them.
+If you already have a decrypted folder dump, the build needs no keys or firmware. For encrypted NSP/XCI inputs, it uses
+your local key files through upstream hactool; neither game content nor keys are included in this repository or sent to
+CI.
 
 ## What you need
 
@@ -62,11 +63,40 @@ build needs the game as the 1.4.1 update leaves it, plus the base game's executa
   and Korean) as `.ttf` or `.otf` in `deps\fonts`; without those, Windows' own fonts (Segoe UI, Microsoft YaHei,
   Microsoft JhengHei, Malgun Gothic) are used. The log says which file each font type got.
 
+## Encrypted NSP and XCI inputs
+
+You can give the builder a base game package and a 1.4.1 update package directly. Each input can be an `.nsp` or an
+`.xci`; the base game's program module, the update's program and control data, and the update-applied RomFS are extracted
+locally into `build/import/` before the normal import and CPU coverage steps run.
+
+```bat
+.venv\Scripts\python scripts\setup.py --base "Super Mario Odyssey.nsp" --update "Super Mario Odyssey Update.nsp"
+```
+
+The encrypted path needs the `prod.keys` dumped from your own console. The importer checks `%USERPROFILE%\.switch`,
+Ryujinx/Ryubing's `system` folder, and the standard XDG path; you can also pass `--keys "<path to your prod.keys>"`.
+If the package uses rights-ID encryption, hactool also needs the matching `title.keys`; put it beside `prod.keys` or
+pass `--title-keys "<path to your title.keys>"`. Hactool reads title-key entries in the `rights_id = title_key` format
+described in its [external key documentation](https://github.com/SciresM/hactool#external-keys). The files stay on this
+PC. The [Ryubing setup guide](https://docs.ryujinx.app/guides/setup-guide/) describes the emulator's local key folder;
+obtain keys only from your own console.
+The pinned [hactool 1.4.0 Windows release](https://github.com/SciresM/hactool/releases/tag/1.4.0) is downloaded on
+first use into ignored `deps/` and checked against a pinned SHA-256 before it runs. Its ISC license is in
+`licenses/hactool-ISC.txt` and is copied beside the local executable. You can use another hactool executable with
+`--hactool`.
+
+For an XCI base cartridge with a separately dumped update, use the XCI for `--base` and the update NSP for `--update`.
+Both packages must resolve to Super Mario Odyssey, and the update control data must report version 1.4.1. The importer
+uses hactool's base-NCA support to apply a BKTR RomFS update. It checks the program id, SDK versions and expected RomFS
+folders before continuing. The ordinary `--dump` route above remains available for files already extracted by a
+homebrew dumper.
+
 ## The steps
 
 ```
 deps       check the Python packages, clang, the Vulkan SDK, SDL3 and the WebView2 SDK
-import     your dump -> build/dump (modules as ELF, versions); RomFS and Help read in place   tools/extract/extract.py
+decrypt    optional NSP/XCI pair -> build/import/dump using local hactool and local keys
+import     your decrypted folder -> build/dump (modules as ELF, versions); RomFS and Help read in place
 functions  every function of each module, with exact boundaries                             tools/extract/functions.py
 lift       AArch64 -> C for every function -> build/lift/main                               tools/lifter/recomp.py
 compile    the lifted C -> objects (clang -O1, incremental)                                 tools/lifter/build_main.py
@@ -137,7 +167,8 @@ counter is zero.
 - **A tool is missing:** the `deps` step names it; install it or set the variable it names (`LLVM_ROOT`,
   `VULKAN_HEADERS`, `SDL3_ROOT`, `WEBVIEW2_ROOT`).
 - **The import stops:** it names the piece it could not find or that is not what it should be (another game, another
-  version, an encrypted file). Check the folder layout above.
+  version, an encrypted file). Check the folder layout above. For NSP/XCI input, check that `prod.keys` matches the dump;
+  if hactool reports a missing title key, add the matching local `title.keys` file.
 - **The first minutes are slow, or loading screens pause:** shaders are being translated and compiled; the cache in
   `build\cache\vk` makes the next run faster.
 - **"NOT IMPLEMENTED in the Vulkan back end, skipped" in the log:** an NVN feature the renderer does not have yet; the
