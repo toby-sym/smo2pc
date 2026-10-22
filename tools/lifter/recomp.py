@@ -787,12 +787,20 @@ class Fn:
                     return 'v_f3v(%s, %s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), op, sz, fcount())
                 if opc == 3 and u and size:
                     return 'v_bitsel(%s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), size, q)
+                if opc in (0x0e, 0x0f):              # SABD/UABD, SABA/UABA
+                    if size == 3:
+                        raise Unimpl('simd-i3')
+                    return 'v_absdiff(%s, %s, %s, %d, %d, %d, %d);' % (
+                        V(rd), V(rn), V(rm), size, u, opc == 0x0f, icount(size))
                 op = {(0, 0x10): 'I_ADD', (1, 0x10): 'I_SUB', (0, 0x13): 'I_MUL', (1, 0x11): 'I_CMEQ', (0, 0x11): 'I_CMTST',
                       (0, 0x06): 'I_CMGT', (1, 0x06): 'I_CMHI', (0, 0x07): 'I_CMGE', (1, 0x07): 'I_CMHS',
+                      (0, 0x0c): 'I_SMAX', (0, 0x0d): 'I_SMIN', (1, 0x0c): 'I_UMAX', (1, 0x0d): 'I_UMIN',
+                      (0, 0x14): 'I_SMAXP', (0, 0x15): 'I_SMINP', (1, 0x14): 'I_UMAXP', (1, 0x15): 'I_UMINP',
                       # SMO additions (audio DSP in the SDK): saturating add / subtract, multiply-accumulate (7.3.2)
                       (0, 0x01): 'I_SQADD', (1, 0x01): 'I_UQADD', (0, 0x05): 'I_SQSUB', (1, 0x05): 'I_UQSUB',
-                      (0, 0x12): 'I_MLA', (0, 0x17): 'I_ADDP'}.get((u, opc))
-                if op is None or (op == 'I_MLA' and size == 3) or (op == 'I_ADDP' and size == 3 and not q):
+                      (0, 0x12): 'I_MLA', (1, 0x12): 'I_MLS', (0, 0x17): 'I_ADDP'}.get((u, opc))
+                if op is None or (op in ('I_MLA', 'I_MLS') and size == 3) or (op == 'I_ADDP' and size == 3 and not q) or \
+                        (op in ('I_SMAX', 'I_SMIN', 'I_UMAX', 'I_UMIN', 'I_SMAXP', 'I_SMINP', 'I_UMAXP', 'I_UMINP') and size == 3):
                     raise Unimpl('simd-i3')
                 return 'v_i3v(%s, %s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), op, size, icount(size))
             if bits(w, 20, 17) == 0 and bits(w, 11, 10) == 2:    # two registers, miscellaneous

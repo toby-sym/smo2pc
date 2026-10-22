@@ -158,7 +158,7 @@ static inline void v_f1v(V128 *d, const V128 *pn, int op, int dbl, int n) {
     *d = r;
 }
 
-enum { I_ADD, I_SUB, I_MUL, I_CMEQ, I_CMGT, I_CMHI, I_CMGE, I_CMHS, I_CMTST, I_SQADD, I_UQADD, I_SQSUB, I_UQSUB, I_MLA, I_ADDP };
+enum { I_ADD, I_SUB, I_MUL, I_CMEQ, I_CMGT, I_CMHI, I_CMGE, I_CMHS, I_CMTST, I_SQADD, I_UQADD, I_SQSUB, I_UQSUB, I_MLA, I_ADDP, I_SMAX, I_SMIN, I_UMAX, I_UMIN, I_SMAXP, I_SMINP, I_UMAXP, I_UMINP, I_MLS };
 
 /* saturation of an exact result to a signed / unsigned element of size sz (FPSR.QC is not modelled; the lifter
  * reads FPSR as 0) */
@@ -178,11 +178,26 @@ static inline uint64_t v_sat_u(__int128 v, int sz) {
 static inline void v_i3v(V128 *d, const V128 *pn, const V128 *pm, int op, int sz, int n) {
     V128 a = *pn, b = *pm, acc = *d, r;
     r.d[0] = 0; r.d[1] = 0;
-    if (op == I_ADDP) {
-        /* [doc] Arm Instruction Set Reference Guide D6.5: pair adjacent lanes in n, then m. */
+    if (op == I_ADDP || op == I_SMAXP || op == I_SMINP || op == I_UMAXP || op == I_UMINP) {
+        /* [doc] Arm Instruction Set Reference Guide D6.5, D6.162, D6.164, D6.245, D6.248. */
         for (int i = 0; i < n / 2; i++) {
-            vset(&r, sz, i, vget(&a, sz, 2 * i) + vget(&a, sz, 2 * i + 1));
-            vset(&r, sz, i + n / 2, vget(&b, sz, 2 * i) + vget(&b, sz, 2 * i + 1));
+            uint64_t ax = vget(&a, sz, 2 * i), ay = vget(&a, sz, 2 * i + 1);
+            uint64_t bx = vget(&b, sz, 2 * i), by = vget(&b, sz, 2 * i + 1);
+            uint64_t az = ax + ay, bz = bx + by;
+            if (op == I_SMAXP || op == I_SMINP || op == I_UMAXP || op == I_UMINP) {
+                int is_signed = op == I_SMAXP || op == I_SMINP;
+                int is_max = op == I_SMAXP || op == I_UMAXP;
+                int a_cmp = is_signed ? (vsext(ax, sz) > vsext(ay, sz)) : (ax > ay);
+                int b_cmp = is_signed ? (vsext(bx, sz) > vsext(by, sz)) : (bx > by);
+                if (is_max) { az = a_cmp ? ax : ay; bz = b_cmp ? bx : by; }
+                else {
+                    int a_lt = is_signed ? (vsext(ax, sz) < vsext(ay, sz)) : (ax < ay);
+                    int b_lt = is_signed ? (vsext(bx, sz) < vsext(by, sz)) : (bx < by);
+                    az = a_lt ? ax : ay; bz = b_lt ? bx : by;
+                }
+            }
+            vset(&r, sz, i, az);
+            vset(&r, sz, i + n / 2, bz);
         }
         *d = r;
         return;
@@ -194,6 +209,12 @@ static inline void v_i3v(V128 *d, const V128 *pn, const V128 *pm, int op, int sz
         case I_ADD: z = x + y; break;
         case I_SUB: z = x - y; break;
         case I_MUL: z = x * y; break;
+        case I_MLS: z = vget(&acc, sz, i) - x * y; break;
+        /* [doc] Arm Instruction Set Reference Guide D6.161, D6.164, D6.244, D6.247. */
+        case I_SMAX: z = vsext(x, sz) > vsext(y, sz) ? x : y; break;
+        case I_SMIN: z = vsext(x, sz) < vsext(y, sz) ? x : y; break;
+        case I_UMAX: z = x > y ? x : y; break;
+        case I_UMIN: z = x < y ? x : y; break;
         case I_CMEQ: z = x == y ? ones : 0; break;
         case I_CMGT: z = vsext(x, sz) > vsext(y, sz) ? ones : 0; break;
         case I_CMGE: z = vsext(x, sz) >= vsext(y, sz) ? ones : 0; break;
@@ -207,6 +228,24 @@ static inline void v_i3v(V128 *d, const V128 *pn, const V128 *pm, int op, int sz
         case I_MLA: z = vget(&acc, sz, i) + x * y; break;            /* d += n * m, modulo the size */
         }
         vset(&r, sz, i, z);
+    }
+    *d = r;
+}
+
+/* [doc] Arm Instruction Set Reference Guide D6.144 / D6.142: absolute difference, optionally accumulated in d. */
+static inline void v_absdiff(V128 *d, const V128 *pn, const V128 *pm, int sz, int is_unsigned, int acc, int n) {
+    V128 a = *pn, b = *pm, r = *d;
+    if (!acc) { r.d[0] = 0; r.d[1] = 0; }
+    else if (n * (1 << sz) == 8) r.d[1] = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t x = vget(&a, sz, i), y = vget(&b, sz, i), diff;
+        if (is_unsigned) diff = x >= y ? x - y : y - x;
+        else {
+            int64_t sx = vsext(x, sz), sy = vsext(y, sz);
+            diff = sx >= sy ? (uint64_t)sx - (uint64_t)sy : (uint64_t)sy - (uint64_t)sx;
+        }
+        if (acc) diff += vget(&r, sz, i);
+        vset(&r, sz, i, diff);
     }
     *d = r;
 }
