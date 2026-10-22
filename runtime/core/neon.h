@@ -221,6 +221,72 @@ static inline void v_addv(V128 *d, const V128 *pn, int sz, int n) {
     *d = r;
 }
 
+/* [doc] Arm Instruction Set Reference Guide D6.148 / D6.146: widen adjacent pairs, optionally accumulating in d. */
+static inline void v_addlp(V128 *d, const V128 *pn, int sz, int is_unsigned, int acc, int n) {
+    V128 a = *pn, r;
+    if (acc) {
+        r = *d;
+        if (n * (1 << sz) == 8) r.d[1] = 0;
+    } else {
+        r.d[0] = 0; r.d[1] = 0;
+    }
+    for (int i = 0; i < n / 2; i++) {
+        uint64_t x = vget(&a, sz, 2 * i), y = vget(&a, sz, 2 * i + 1);
+        uint64_t sum = is_unsigned ? x + y : (uint64_t)(vsext(x, sz) + vsext(y, sz));
+        if (acc) sum += vget(&r, sz + 1, i);
+        vset(&r, sz + 1, i, sum);
+    }
+    *d = r;
+}
+
+/* [doc] Arm Instruction Set Reference Guide D6.149: sum all input lanes into a scalar of twice their width. */
+static inline void v_addlv(V128 *d, const V128 *pn, int sz, int is_unsigned, int n) {
+    uint64_t sum = 0;
+    for (int i = 0; i < n; i++)
+        sum += is_unsigned ? vget(pn, sz, i) : (uint64_t)vsext(vget(pn, sz, i), sz);
+    V128 r;
+    r.d[0] = 0; r.d[1] = 0;
+    vset(&r, sz + 1, 0, sum);
+    *d = r;
+}
+
+/* [doc] Arm Instruction Set Reference Guide D6.147 / D6.150: widen and add/subtract narrow lanes. */
+static inline void v_wide_add(V128 *d, const V128 *pn, const V128 *pm, int sz, int upper,
+                              int is_unsigned, int sub, int wide) {
+    V128 a = *pn, b = *pm, r;
+    int n = 8 >> sz;
+    r.d[0] = 0; r.d[1] = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t x = wide ? vget(&a, sz + 1, i) : vget(&a, sz, upper * n + i);
+        uint64_t y = vget(&b, sz, upper * n + i);
+        if (!is_unsigned) {
+            if (!wide) x = (uint64_t)vsext(x, sz);
+            y = (uint64_t)vsext(y, sz);
+        }
+        vset(&r, sz + 1, i, sub ? x - y : x + y);
+    }
+    *d = r;
+}
+
+/* [doc] Arm Instruction Set Reference Guide D6.145 / D6.143: widen absolute differences, optionally accumulating. */
+static inline void v_wide_absdiff(V128 *d, const V128 *pn, const V128 *pm, int sz, int upper,
+                                  int is_unsigned, int acc) {
+    V128 a = *pn, b = *pm, r = *d;
+    int n = 8 >> sz;
+    if (!acc) { r.d[0] = 0; r.d[1] = 0; }
+    for (int i = 0; i < n; i++) {
+        uint64_t x = vget(&a, sz, upper * n + i), y = vget(&b, sz, upper * n + i), diff;
+        if (is_unsigned) diff = x >= y ? x - y : y - x;
+        else {
+            int64_t delta = vsext(x, sz) - vsext(y, sz);
+            diff = (uint64_t)(delta < 0 ? -delta : delta);
+        }
+        if (acc) diff += vget(&r, sz + 1, i);
+        vset(&r, sz + 1, i, diff);
+    }
+    *d = r;
+}
+
 /* SMULL/UMULL, SMLAL/UMLAL, SMLSL/UMLSL (vector and by element). Source elements of size sz from the lower
  * (upper = 0) or upper (SMULL2 ..., upper = 1) half of n and m; results of size sz + 1 fill d. acc: 0 = d := product,
  * 1 = d += product, 2 = d -= product (modulo the result size, as the instructions do). elem >= 0: every product uses

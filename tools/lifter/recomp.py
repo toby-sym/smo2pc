@@ -797,6 +797,10 @@ class Fn:
                 return 'v_i3v(%s, %s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), op, size, icount(size))
             if bits(w, 20, 17) == 0 and bits(w, 11, 10) == 2:    # two registers, miscellaneous
                 opc = bits(w, 16, 12)
+                if not scalar and opc in (0x02, 0x06):   # SADDLP/UADDLP, SADALP/UADALP
+                    if size == 3:
+                        raise Unimpl('simd-across')
+                    return 'v_addlp(%s, %s, %d, %d, %d, %d);' % (V(rd), V(rn), size, u, opc == 0x06, icount(size))
                 op = {(0, 1, 0x0f): 'F1_ABS', (1, 1, 0x0f): 'F1_NEG', (1, 1, 0x1f): 'F1_SQRT', (1, 1, 0x1d): 'F1_RSQRTE',
                       (0, 1, 0x1d): 'F1_RECPE', (0, 0, 0x1d): 'F1_SCVTF', (1, 0, 0x1d): 'F1_UCVTF', (0, 1, 0x1b): 'F1_CVTZS',
                       (1, 1, 0x1b): 'F1_CVTZU', (0, 1, 0x0d): 'F1_CMEQ0', (0, 1, 0x0c): 'F1_CMGT0', (1, 1, 0x0c): 'F1_CMGE0',
@@ -816,7 +820,16 @@ class Fn:
             if scalar and u and bits(w, 20, 17) == 8 and bits(w, 16, 12) == 0x0d and bits(w, 11, 10) == 2:
                 f, ft = ('df', 'double') if sz else ('f', 'float')   # faddp scalar
                 return '{ %s t = c->v[%d].%s[0] + c->v[%d].%s[1]; vzero(%s); c->v[%d].%s[0] = t; }' % (ft, rn, f, rn, f, V(rd), rd, f)
-            if bits(w, 11, 10) == 0 and not scalar and size < 3:    # SMO addition: three registers, different types
+            if bits(w, 11, 10) == 0 and not scalar and size < 3:    # three registers, different element widths
+                wide_op = {0x0: (0, 0), 0x1: (0, 1), 0x2: (1, 0), 0x3: (1, 1)}.get(bits(w, 15, 12))
+                if wide_op is not None:
+                    sub, wide = wide_op
+                    return 'v_wide_add(%s, %s, %s, %d, %d, %d, %d, %d);' % (
+                        V(rd), V(rn), V(rm), size, q, u, sub, wide)
+                abs_acc = {0x5: 1, 0x7: 0}.get(bits(w, 15, 12))  # SABAL/UABAL, SABDL/UABDL (and the "2" forms)
+                if abs_acc is not None:
+                    return 'v_wide_absdiff(%s, %s, %s, %d, %d, %d, %d);' % (
+                        V(rd), V(rn), V(rm), size, q, u, abs_acc)
                 acc = {0xc: 0, 0x8: 1, 0xa: 2}.get(bits(w, 15, 12))  # SMULL/UMULL, SMLAL/UMLAL, SMLSL/UMLSL (and the "2" forms)
                 if acc is not None:
                     return 'v_mull(%s, %s, %s, %d, %d, %d, %d, -1);' % (V(rd), V(rn), V(rm), size, q, u, acc)
@@ -825,6 +838,10 @@ class Fn:
                 if size == 3 or (size == 2 and not q):
                     raise Unimpl('simd-across')
                 return 'v_addv(%s, %s, %d, %d);' % (V(rd), V(rn), size, icount(size))
+            if not scalar and bits(w, 20, 17) == 8 and bits(w, 16, 12) == 0x07 and bits(w, 11, 10) == 2:
+                if size == 3 or (size == 2 and not q):
+                    raise Unimpl('simd-across')
+                return 'v_addlv(%s, %s, %d, %d, %d);' % (V(rd), V(rn), size, u, icount(size))
             raise Unimpl('simd-e')
         if bits(w, 27, 24) == 0xe:
             if bits(w, 15, 15) == 0 and bits(w, 10, 10) == 1:    # copy: dup / ins / umov / smov
