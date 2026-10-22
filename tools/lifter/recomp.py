@@ -347,6 +347,10 @@ class Fn:
             opc, mode, load = bits(w, 31, 30), bits(w, 24, 23), bits(w, 22, 22)
             rt2 = bits(w, 14, 10)
             if v:
+                # SIMD&FP pair encodings reserve opc == 3. Reject it before
+                # deriving a 32-byte width for the 128-bit register helpers.
+                if opc == 3:
+                    raise Unimpl('pair')
                 size = 4 << opc
             else:
                 if opc == 3 or (opc == 1 and not load):
@@ -402,6 +406,10 @@ class Fn:
             opc = bits(w, 31, 30)
             a = '0x%xULL' % (pc + sext(bits(w, 23, 5), 19) * 4)
             if v:
+                # SIMD&FP literal loads reserve opc == 3; size 32 would read
+                # beyond the 128-bit vector register.
+                if opc == 3:
+                    raise Unimpl('ldst-v')
                 return 'c->v[%d] = rdv(%s, %d);' % (rt, a, 4 << opc)
             if opc == 3:
                 return ';'
