@@ -436,7 +436,7 @@ class Fn:
                     return SET(rt, 1, 'rd%d(%s)' % (nb, XS(rn)))
                 return 'wr%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
             if load:                                     # ldxr / ldaxr: remember address and value
-                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_size = %d; c->ex_val = rd%d(a); %s }' % (XS(rn), nb, nb, SET(rt, 1, 'c->ex_val'))
+                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_size = %d; c->ex_val = rd%d(a); %s }' % (XS(rn), nb // 8, nb, SET(rt, 1, 'c->ex_val'))
             # stxr / stlxr: succeeds only if the value is still the one loaded (compare-and-swap)
             return SET(rs, 0, 'stx%d(c, %s, %s)' % (nb, XS(rn), R(rt, size == 3)))
         if bits(w, 31, 31) == 0 and bits(w, 29, 24) in (0x0c, 0x0d):   # AdvSIMD structure load/store
