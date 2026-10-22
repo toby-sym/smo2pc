@@ -1,4 +1,9 @@
-# smo-recomp
+# smo2pc
+
+`smo2pc` is a development fork of [smo-recomp](https://github.com/coz-0/smo-recomp), a Super Mario Odyssey static
+recompiler. The upstream project supplies the AArch64 lifter, host runtime and Vulkan renderer; this repository keeps
+that GPL-3.0-or-later foundation and adds its own project identity and build/release automation. See [LICENSE](LICENSE)
+and [CONTRIBUTING.md](CONTRIBUTING.md) before contributing.
 
 A native Windows x64 version of *Super Mario Odyssey* (1.4.1), made by **static recompilation** of the Nintendo
 Switch game, with its own runtime and a Vulkan renderer.
@@ -74,6 +79,13 @@ py -3.13 -m venv .venv
 
 The first build takes a while (lifting and compiling the game); later runs of `setup.py` only redo what changed.
 [`docs/building.md`](docs/building.md) has the details, settings and troubleshooting.
+
+## CI and releases
+
+Every branch push and pull request validates the Python tools and publishes a versioned source ZIP as an Actions
+artifact for 14 days. A tag such as `v0.1.0` publishes a GitHub Release with the source ZIP and its SHA-256 checksum.
+Actions never builds the game executable: that requires a local game dump and Windows graphics SDKs, which stay on
+your PC.
 
 ## Repository layout
 

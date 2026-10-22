@@ -1,0 +1,121 @@
+name: Build
+run-name: ${{ github.ref_type == 'tag' && format('Release {0}', github.ref_name) || (inputs.build_type == 'release' && format('Release {0}', inputs.tag_name) || 'Dev source build') }}
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: Build type
+        type: choice
+        default: dev
+        options: [dev, release]
+      tag_name:
+        description: Existing release tag (vX.Y.Z); leave empty for dev
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      build_type:
+        type: string
+        default: dev
+      tag_name:
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smo2pc-build-${{ github.event_name }}-${{ github.ref }}-${{ inputs.tag_name }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && inputs.build_type != 'release' }}
+
+jobs:
+  prepare:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      ref: ${{ steps.version.outputs.ref }}
+      channel: ${{ steps.version.outputs.channel }}
+      artifact: ${{ steps.version.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Resolve version and source commit
+        id: version
+        shell: pwsh
+        env:
+          BUILD_TYPE: ${{ inputs.build_type || (github.ref_type == 'tag' && 'release') || 'dev' }}
+          TAG_NAME: ${{ inputs.tag_name }}
+        run: python tools/resolve-build-version.py
+
+  verify:
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.ref }}
+
+  package:
+    name: Source bundle
+    needs: [prepare, verify]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Package source and checksum
+        env:
+          BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+        run: python tools/package-source.py --version $env:BUILD_VERSION
+      - name: Upload versioned source bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ needs.prepare.outputs.artifact }}
+          path: |
+            artifacts/distribution/*.zip
+            artifacts/distribution/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: needs.prepare.outputs.channel == 'release'
+    needs: [prepare, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.prepare.outputs.artifact }}
+          path: release-assets
+      - name: Publish tagged source bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.ref }}
+        run: |
+          tag_commit="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha 2>/dev/null || true)"
+          if [ -n "$tag_commit" ] && [ "$tag_commit" != "$SOURCE_COMMIT" ]; then
+            echo "The release tag moved after the source bundle was prepared." >&2
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --target "$SOURCE_COMMIT" --title "SMO2PC $RELEASE_VERSION" --generate-notes
+          fi

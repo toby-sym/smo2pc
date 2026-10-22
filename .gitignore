@@ -3,6 +3,7 @@
 
 # everything scripts/setup.py produces from your dump, and tools you put in deps/
 /build/
+/artifacts/
 /deps/
 /dump/
 /work/
