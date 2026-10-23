@@ -3243,10 +3243,16 @@ static void vk_present(void *arg) { vk_present2(arg, 0); }
 static void vk_present2(void *arg, int progress) {
     PresentJob *j = arg;
     static int shot = -2, every, shot_from, shot_to;
+    static int window_format_logged;
     if (!V.alive) return;
     LONG64 t_present = tk();
     Tex *t = j->win && j->index >= 0 && j->index < j->win->count ? j->win->tex[j->index] : NULL;
     VTex *vt = t && !t->dead ? t->vk : NULL;
+    if (D.debug && !window_format_logged && t && vt) {
+        printf("nvn_vk: window texture %p NVN format 0x%x, Vulkan format %d, %dx%d, %d bytes per pixel%s\n",
+               (void *)t, t->b.format, (int)vt->fmt, vt->w, vt->h, vt->bpb, vt->rs ? " (scaled)" : "");
+        window_format_logged = 1;
+    }
     LONG64 frame = nvn_front_frame_next();
     {   /* SMO_VK_WD_TEST=<frame>[,<seconds>] holds the render thread at that frame (default 12 s), to see the watchdog's report */
         static int wt = -2, ws = 12;
