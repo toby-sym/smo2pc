@@ -13,6 +13,7 @@
  *     sample shading): few keys per pair, which is what makes the prediction possible.
  * One lock (g_sh_lock) guards the stage table, the pipeline table, the signature / pair tables and the job queue. */
 #include <psapi.h>
+#include <stdint.h>
 typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
 typedef struct VStage {
     uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
@@ -467,8 +468,8 @@ typedef struct PairLib { VStage *vs, *fs; uint8_t samples, sshade; volatile LONG
 static PairLib *g_plib[1024];
 static CRITICAL_SECTION g_gpl_lock;
 static volatile LONG g_in_scene;
-static struct { PKey k; VkPipeline lib; } g_olib[128];
-static int g_nolib;
+static struct { PKey k; VkPipeline lib; } *g_olib;
+static size_t g_nolib, g_olib_cap;
 static VkPipeline g_vilib[3];
 static LONG64 g_gpl_made, g_gpl_made_tk, g_gpl_draw, g_gpl_draw_tk, g_gpl_draw_max, g_gpl_wait, g_gpl_wait_tk, g_gpl_link, g_gpl_link_tk, g_gpl_link_max, g_gpl_dlink, g_gpl_dlink_tk, g_gpl_dlink_max, g_gpl_dlink_scene;
 static DWORD g_render_tid;
@@ -582,10 +583,16 @@ static VkPipeline gpl_olib(const PKey *k0) {
     PKey k = *k0;
     k.vs = k.fs = 0; k.topo_class = 0;
     EnterCriticalSection(&g_gpl_lock);
-    int i;
+    size_t i;
     for (i = 0; i < g_nolib; i++) if (!memcmp(&g_olib[i].k, &k, sizeof k)) break;
     if (i == g_nolib) {
-        if (g_nolib == 128) vkd_fail("more than 128 pass signatures (fragment output libraries)");
+        if (g_nolib == g_olib_cap) {
+            size_t cap = g_olib_cap ? g_olib_cap * 2 : 128;
+            if (cap < g_olib_cap || cap > SIZE_MAX / sizeof *g_olib) vkd_fail("too many pass signatures (fragment output libraries)");
+            void *p = realloc(g_olib, cap * sizeof *g_olib);
+            if (!p) vkd_fail("could not allocate %llu pass signatures (fragment output libraries)", (unsigned long long)cap);
+            g_olib = p; g_olib_cap = cap;
+        }
         VkPipelineMultisampleStateCreateInfo ms; VkSampleMask smask;
         gpl_ms(&ms, &smask, k.samples, k.sshade);
         VkPipelineColorBlendAttachmentState ba[8];
@@ -719,8 +726,8 @@ static void gpl_destroy(void) {
     for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i]; v; v = v->next) { if (v->lib) { vkDestroyPipeline(V.device, v->lib, NULL); v->lib = NULL; } if (v->lib2) { vkDestroyPipeline(V.device, v->lib2, NULL); v->lib2 = NULL; } }
     if (g_ulayout) { vkDestroyPipelineLayout(V.device, g_ulayout, NULL); vkDestroyDescriptorSetLayout(V.device, g_udl[0], NULL); vkDestroyDescriptorSetLayout(V.device, g_udl[1], NULL); g_ulayout = NULL; }
     for (int i = 0; i < 1024; i++) for (PairLib *l = g_plib[i], *n; l; l = n) { n = l->next; if (l->lib) vkDestroyPipeline(V.device, l->lib, NULL); if (l->layout) vkDestroyPipelineLayout(V.device, l->layout, NULL); for (int k = 0; k < 2; k++) if (l->dl[k]) vkDestroyDescriptorSetLayout(V.device, l->dl[k], NULL); free(l); g_plib[i] = NULL; }
-    for (int i = 0; i < g_nolib; i++) vkDestroyPipeline(V.device, g_olib[i].lib, NULL);
-    g_nolib = 0;
+    for (size_t i = 0; i < g_nolib; i++) vkDestroyPipeline(V.device, g_olib[i].lib, NULL);
+    free(g_olib); g_olib = NULL; g_nolib = g_olib_cap = 0;
     for (int i = 0; i < 3; i++) if (g_vilib[i]) { vkDestroyPipeline(V.device, g_vilib[i], NULL); g_vilib[i] = NULL; }
 }
 /* A pipeline linked at once from libraries is not optimised across its stages (measured by ssbu-recomp in Super Smash Bros. Ultimate on
@@ -1638,9 +1645,9 @@ static void pipelines_report(void) {
     if (D.has_gpl) {
         double q = 1000.0 / (double)fq.QuadPart;
         printf("nvn_vk_gpl: pair libraries compiled by the workers: %lld (%.0f ms of worker time; %lld of them asked for as shared vertex stage x fragment stage without a program of its own: %d such fragment stages, %d shared vertex stages); "
-               "PAIR LIBRARY COMPILED AT A DRAW (a hold): %lld, %.1f ms, longest %.2f ms; waited for at a draw or by a worker: %lld, %.1f ms | pipelines LINKED at a draw from ready libraries: %lld (%lld in scene frames), %.1f ms in all, longest %.2f ms; linked by workers: %lld, %.0f ms; %d fragment output libraries\n",
+               "PAIR LIBRARY COMPILED AT A DRAW (a hold): %lld, %.1f ms, longest %.2f ms; waited for at a draw or by a worker: %lld, %.1f ms | pipelines LINKED at a draw from ready libraries: %lld (%lld in scene frames), %.1f ms in all, longest %.2f ms; linked by workers: %lld, %.0f ms; %llu fragment output libraries\n",
                (long long)g_gpl_made, (double)g_gpl_made_tk * q, (long long)g_gpl_cross, g_nfo, g_nshvs, (long long)g_gpl_draw, (double)g_gpl_draw_tk * q, (double)g_gpl_draw_max * q, (long long)g_gpl_wait, (double)g_gpl_wait_tk * q,
-               (long long)g_gpl_dlink, (long long)g_gpl_dlink_scene, (double)g_gpl_dlink_tk * q, (double)g_gpl_dlink_max * q, (long long)g_gpl_link, (double)g_gpl_link_tk * q, g_nolib);
+               (long long)g_gpl_dlink, (long long)g_gpl_dlink_scene, (double)g_gpl_dlink_tk * q, (double)g_gpl_dlink_max * q, (long long)g_gpl_link, (double)g_gpl_link_tk * q, (unsigned long long)g_nolib);
     }
     if (D.has_gpl) printf("nvn_vk_gpl: mode %s; pipelines linked again with optimisation by the workers: %lld of %lld queued, %.0f ms of worker time\n", gpl_sep() ? "2 (a library per stage)" : "1 (a library per stage pair)", (long long)g_gpl_opt_n, (long long)g_gpl_opt_q, (double)g_gpl_opt_tk * 1000.0 / (double)fq.QuadPart);
     printf("nvn_vk_skip: shader_wait = %s; draws left out because a stage or pipeline was not ready: %lld in %lld frames (stage not ready %lld, pipeline not ready %lld)\n", skip_on() ? "skip (near a scene)" : "hold (the default)", (long long)g_skip_n, (long long)g_skip_frames, (long long)g_skip_stage, (long long)g_skip_pipe);
