@@ -2046,10 +2046,10 @@ static int draw_prepare(unsigned prim) {
             static int want = -2;
             want = passshot_frame() ? 1 : -1;
             if (want >= 0)
-                printf("nvn_vk_draw: prim %u programs vs #%d fs #%d gs #%d target %p | viewport %s %.0f %.0f %.0f %.0f | scissor %s %d %d %d %d | pass %dx%d in_pass %d | cull %u discard %d render_off %d | chanmask %08x blend_on %x blend0 %u %u %u %u %u %u | ds %llx\n",
+                printf("nvn_vk_draw: prim %u programs vs #%d fs #%d gs #%d target %p | viewport %s %.0f %.0f %.0f %.0f | scissor %s %d %d %d %d | pass %dx%d in_pass %d | cull %u discard %d render_off %d | chanmask %08x blend_on %x logic %u blend0 %u %u %u %u %u %u | ds %llx\n",
                        prim, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1, R.prog[2] ? R.prog[2]->serial : -1, (void *)R.col[0].tex, R.have_viewport ? "set" : "default", R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3],
                        R.have_scissor ? "set" : "default", R.scissor[0], R.scissor[1], R.scissor[2], R.scissor[3], R.pass_w, R.pass_h, R.in_pass,
-                       (unsigned)(R.poly[0] & 3), R.rast_discard, R.render_off, R.chanmask, (unsigned)R.blend_on,
+                       (unsigned)(R.poly[0] & 3), R.rast_discard, R.render_off, R.chanmask, (unsigned)R.blend_on, (unsigned)R.logic,
                        R.blend[0][0], R.blend[0][1], R.blend[0][2], R.blend[0][3], R.blend[0][4], R.blend[0][5], (unsigned long long)R.ds);
                 if (want >= 0) printf("nvn_vk_draw:   depth target %p fmt 0x%x %dx%d drange %g..%g polyoff %g %g %g poly %u %u %u %u\n", (void *)R.depth.tex, R.depth.tex ? R.depth.tex->b.format : 0, R.depth.tex ? R.depth.tex->b.width : 0, R.depth.tex ? R.depth.tex->b.height : 0, R.drange[0], R.drange[1], R.polyoff[0], R.polyoff[1], R.polyoff[2], R.poly[0], R.poly[1], R.poly[2], R.poly[3]);
             if (want >= 0) {
