@@ -2996,9 +2996,20 @@ static void save_bmp_vk(const char *path, VTex *vt) {
     }
     free(px);
 }
+static uint8_t pass_ufloat8(uint32_t v, unsigned mantissa_bits) {
+    uint32_t mant_mask = (1u << mantissa_bits) - 1;
+    unsigned mant = v & mant_mask, exp = (v >> mantissa_bits) & 31;
+    if (exp == 31) return mant ? 0 : 255;              /* NaN -> black, +infinity -> white */
+    float f = exp == 0 ? ldexpf((float)mant, -14 - (int)mantissa_bits)
+                       : ldexpf(1.0f + (float)mant / (float)(1u << mantissa_bits), (int)exp - 15);
+    if (!(f > 0.0f)) return 0;
+    if (f >= 1.0f) return 255;
+    return (uint8_t)(f * 255.0f + 0.5f);
+}
 /* debug aid SMO_VK_PASSSHOT=<frame> (or a range, passshot_frame): at the end of every render pass of that frame,
  * colour target 0 is read back (read_region, the ReadTexels path) and saved as pass_[<frame>_]<n>_<format>.bmp in SMO_SHOT_DIR, with one line of figures
- * (pixels not black, mean of each channel). RGB10A2 (0x3d) is decoded to 8 bits per channel; 8-bit RGBA as is. */
+ * (pixels not black, mean of each channel). RGB10A2 (0x3d) and R11G11B10F (0x3f) are decoded to 8 bits per channel;
+ * 8-bit RGBA is saved as is. */
 static void pass_shot(void) {
     static int want = -2, n, busy;
     want = passshot_frame() ? 1 : -1;
@@ -3044,10 +3055,13 @@ static void pass_shot(void) {
         free(hp);
     } else if (px) got = read_region(t, NULL, rr, px, 0, 0) != 0;
     if (got) {
-        int ten = t->b.format == 0x3d || t->b.format == 0x3e;
+        int ten = t->b.format == 0x3d || t->b.format == 0x3e, ufloat11 = t->b.format == 0x3f;
         long long lit = 0, alpha_hist[4] = {0, 0, 0, 0}; double sum[3] = {0, 0, 0};
-        for (size_t k = 0; k < (size_t)w * h; k++) { uint32_t q; memcpy(&q, px + k * 4, 4); alpha_hist[ten ? q >> 30 : (q >> 24) >> 6]++; }
-        printf("nvn_vk_pass: pass %d: alpha (top two bits) histogram 0:%lld 1:%lld 2:%lld 3:%lld\n", n, alpha_hist[0], alpha_hist[1], alpha_hist[2], alpha_hist[3]);
+        if (ufloat11) printf("nvn_vk_pass: pass %d: alpha n/a (packed R11G11B10F)\n", n);
+        else {
+            for (size_t k = 0; k < (size_t)w * h; k++) { uint32_t q; memcpy(&q, px + k * 4, 4); alpha_hist[ten ? q >> 30 : (q >> 24) >> 6]++; }
+            printf("nvn_vk_pass: pass %d: alpha (top two bits) histogram 0:%lld 1:%lld 2:%lld 3:%lld\n", n, alpha_hist[0], alpha_hist[1], alpha_hist[2], alpha_hist[3]);
+        }
         uint32_t row = ((uint32_t)w * 3 + 3) & ~3u, size = 54 + row * (uint32_t)h, v;
         char path[300];
         const char *dir = getenv("SMO_SHOT_DIR");
@@ -3060,7 +3074,8 @@ static void pass_shot(void) {
             for (int x = 0; x < w; x++) {
                 const uint8_t *s = px + ((size_t)y * w + x) * 4;
                 int r, g, b;
-                if (ten) { uint32_t q; memcpy(&q, s, 4); r = (int)((q & 1023) >> 2); g = (int)(((q >> 10) & 1023) >> 2); b = (int)(((q >> 20) & 1023) >> 2); }
+                if (ufloat11) { uint32_t q; memcpy(&q, s, 4); r = pass_ufloat8(q & 0x7ff, 6); g = pass_ufloat8((q >> 11) & 0x7ff, 6); b = pass_ufloat8((q >> 22) & 0x3ff, 5); }
+                else if (ten) { uint32_t q; memcpy(&q, s, 4); r = (int)((q & 1023) >> 2); g = (int)(((q >> 10) & 1023) >> 2); b = (int)(((q >> 20) & 1023) >> 2); }
                 else { r = s[0]; g = s[1]; b = s[2]; }
                 rowb[x * 3] = (uint8_t)b; rowb[x * 3 + 1] = (uint8_t)g; rowb[x * 3 + 2] = (uint8_t)r;
                 sum[0] += r; sum[1] += g; sum[2] += b; lit += (r | g | b) > 8;
