@@ -71,11 +71,17 @@ static void vkd_fail(const char *fmt, ...) {
 }
 #define DBG_ASSERT(c, ...) do { if (D.debug && !(c)) vkd_fail(__VA_ARGS__); } while (0)
 /* the pipeline-library mode. SMO_VK_GPL wins (0 = whole pipelines, without libraries; 1 = a library per
- * stage pair, a measurement mode; 2 = a library per stage + loading barrier); without it VK_GPL_DEFAULT. */
+ * stage pair, a measurement mode; 2 = a library per stage + loading barrier); otherwise the default below. */
 #ifndef VK_GPL_DEFAULT
-#define VK_GPL_DEFAULT 2                           /* on by default where the driver has the extension; -DVK_GPL_DEFAULT=0 or SMO_VK_GPL=0 for the old path */
+#define VK_GPL_DEFAULT 2                           /* default for eligible GPUs; -DVK_GPL_DEFAULT=0 or SMO_VK_GPL=0 selects whole pipelines */
 #endif
-static int vk_gpl_mode(void) { static int m = -1; if (m < 0) { const char *e = getenv("SMO_VK_GPL"); m = e && e[0] ? atoi(e) : VK_GPL_DEFAULT; } return m; }
+static int vk_gpl_default(void) {
+    /* On this Iris Xe, the advertised stage-library path left shader workers busy for minutes at startup.
+     * The whole-pipeline path reaches gameplay promptly; SMO_VK_GPL=2 remains available for measurement. */
+    if (V.props.vendorID == 0x8086 && V.props.deviceID == 0x46a6) return 0;
+    return VK_GPL_DEFAULT;
+}
+static int vk_gpl_mode(void) { static int m = -1; if (m < 0) { const char *e = getenv("SMO_VK_GPL"); m = e && e[0] ? atoi(e) : vk_gpl_default(); } return m; }
 
 /* ---------------------------------------------------------------- device features */
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext) {
@@ -120,8 +126,8 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
         int m = vk_gpl_mode();
         printf("nvn_vk_path: %s: %s (SMO_VK_GPL %s; default %d; SMO_VK_GPL=0 is the switch back to whole pipelines)\n",
                D.has_gpl && m >= 2 ? "STAGE LIBRARIES + loading barrier (a draw links, nothing is compiled near a scene)" : D.has_gpl ? "PAIR LIBRARIES (SMO_VK_GPL=1, a measurement mode)" : "WHOLE PIPELINES (made by the workers from the list of earlier runs; a first use can hold a frame)",
-               !m ? (e ? "turned off by SMO_VK_GPL=0" : "off by default in this build") : D.has_gpl ? (e ? "asked for by SMO_VK_GPL" : "the default: the driver has VK_EXT_graphics_pipeline_library, extended dynamic state 3 and dynamic vertex input") :
-               !D.ext_gpl ? "the driver has NO VK_EXT_graphics_pipeline_library: fallen back" : "the driver lacks extended dynamic state 3 or dynamic vertex input: fallen back", e ? e : "not set", VK_GPL_DEFAULT);
+               !m ? (e ? "turned off by SMO_VK_GPL=0" : "off by default for this device") : D.has_gpl ? (e ? "asked for by SMO_VK_GPL" : "the default: the driver has VK_EXT_graphics_pipeline_library, extended dynamic state 3 and dynamic vertex input") :
+               !D.ext_gpl ? "the driver has NO VK_EXT_graphics_pipeline_library: fallen back" : "the driver lacks extended dynamic state 3 or dynamic vertex input: fallen back", e ? e : "not set", vk_gpl_default());
     }
     if (!D.f13.dynamicRendering || !D.f13.synchronization2) vkd_fail("the device lacks dynamicRendering / synchronization2");
     if (!D.has_vids) nvn_vk_missing("a GPU without VK_EXT_vertex_input_dynamic_state (the vertex layout is not yet part of the pipeline key)");
