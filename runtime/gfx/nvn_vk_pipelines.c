@@ -118,6 +118,11 @@ static uint64_t ssrc_hb(const SSrc *o) {
     if (o->cdata) h = fnv(h ^ o->cdata_size, o->cdata, o->cdata_size);
     if (o->stage == 2) h = fnv(h, &o->gprim, sizeof o->gprim);      /* a geometry stage is translated for the draw's primitive class */
     if (o->stage == 1 && RS_ON) h = fnv(h, "rs1", 3);      /* the fragment stages of a run with an internal resolution scale are another translation (MxIn.screen_scale); at 1.0 the hash is the one it always was */
+    { const char *d = getenv("SMO_VK_DIAG_SHADER98");
+      if (o->stage == 1 && o->serial == 98 && d && (!strcmp(d, "uv") || !strcmp(d, "sample"))) {
+          const char *tag = !strcmp(d, "uv") ? "diag98uv" : "diag98sample";
+          h = fnv(h, tag, strlen(tag));
+      } }
     return fnv(h, &ver, 4);
 }
 static VkShaderModule module_from_spv(uint64_t h) {              /* any thread; NULL when the file is not there */
@@ -240,11 +245,15 @@ static VStage *vstage_new(uint64_t hb, int s, int code_len, const uint32_t *key,
 /* Any thread, no lock: fills v (in the table, state 1) from its record on disk, else with the translator and glslang. */
 static void vstage_build(VStage *v, const SSrc *src) {
     int s = v->stage, done = 0;
+    const char *diag98 = getenv("SMO_VK_DIAG_SHADER98");
+    int diag98uv = s == 1 && src->serial == 98 && diag98 && !strcmp(diag98, "uv");
+    int diag98sample = s == 1 && src->serial == 98 && diag98 && !strcmp(diag98, "sample");
+    int diag98shader = diag98uv || diag98sample;
     v->gprim = src->gprim;
     char path[128];
     StageRec r;
     snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), s, (unsigned long long)v->hb);
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = diag98shader ? NULL : fopen(path, "rb");
     if (fp) {
         VarRec e;
         while (!done && fread(&e, 1, sizeof e, fp) == sizeof e) {
@@ -281,6 +290,15 @@ static void vstage_build(VStage *v, const SSrc *src) {
             }
         }
         else {
+            if (diag98shader) {
+                static const char uvdbg[] = "#version 460\nlayout(location=0) in vec4 in_attr0;\nlayout(location=0) out vec4 frag0;\nvoid main() { frag0 = vec4(in_attr0.xy, 0.0, 1.0); }\n";
+                static const char smpdbg[] = "#version 460\nlayout(set=1, binding=40) uniform sampler2D mx_t0_sampler2D;\nlayout(location=0) in vec4 in_attr0;\nlayout(location=0) out vec4 frag0;\nvoid main() { frag0 = texture(mx_t0_sampler2D, in_attr0.xy); }\n";
+                const char *dbg = diag98uv ? uvdbg : smpdbg;
+                size_t ndbg = strlen(dbg) + 1;
+                char *replacement = malloc(ndbg);
+                if (replacement) { memcpy(replacement, dbg, ndbg); free(out.glsl); out.glsl = replacement; }
+                else printf("nvn_vk: program #98 diagnostic: out of memory for replacement GLSL\n");
+            }
             uint64_t spv_hash = 0;
             if (in.screen_scale) { InterlockedIncrement64(&g_rs_stages); if (strstr(out.glsl, "mx_fcs)")) InterlockedIncrement64(&g_rs_fcs); if (strstr(out.glsl, "mx_tf(")) InterlockedIncrement64(&g_rs_tf); }
             int on_disk;
@@ -301,6 +319,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
                 VarRec e;
                 v->key[0] &= v->dep; v->key[1] &= v->dep; v->key[2] &= v->tex_units; v->key[3] &= v->tex_units;
                 v->h = fnv(fnv(v->hb, v->key, 16), &v->fo, 4);
+                if (diag98shader) goto no_record;
                 if (v->images) goto no_record;     /* a stage with images has no record (its images' formats and types are not in it; see above) */
                 memset(&r, 0, sizeof r);
                 r.magic = STAGEREC_MAGIC; r.stage = s; r.code_len = v->code_len; memcpy(r.key, v->key, 16); r.fo = v->fo; r.spv = spv_hash; r.hb = v->hb;
