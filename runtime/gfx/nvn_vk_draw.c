@@ -256,6 +256,9 @@ static uint64_t g_fr_condhash = 1469598103934665603ull;
 /* debug aid SMO_VK_PASSSHOT=<frame> or <first>-<last>[/<step>]: the frames whose render passes pass_shot saves and
  * whose draws are logged (a range finds a defect that shows in some frames only; its files carry the frame number). */
 static long long g_ps_lo = -2, g_ps_hi, g_ps_step = 1;
+static LONG64 g_ps_frame_override = -1, g_ps_deferred_frame = -1;
+static int g_cmd_submitting;
+static LONG64 passshot_frame_number(void) { return g_ps_frame_override >= 0 ? g_ps_frame_override : nvn_front_frame_next(); }
 static void passshot_parse(void) {
     const char *e = getenv("SMO_VK_PASSSHOT"), *d;
     g_ps_lo = -1;
@@ -265,10 +268,11 @@ static void passshot_parse(void) {
 }
 static int passshot_frame(void) {
     if (g_ps_lo == -2) passshot_parse();
-    long long f = nvn_front_frame_next();
+    long long f = passshot_frame_number();
     return g_ps_lo >= 0 && f >= g_ps_lo && f <= g_ps_hi && (f - g_ps_lo) % g_ps_step == 0;
 }
 static int passshot_range(void) { if (g_ps_lo == -2) passshot_parse(); return g_ps_hi > g_ps_lo; }
+static void cmd_wait_all(void);
 /* SMO_VK_COPYLOG=<frame>: trace texture blits and the window texture selected for that presentation. */
 static LONG64 g_copylog_frame = -2;
 static LONG64 copylog_frame(void) {
@@ -303,7 +307,22 @@ static int g_occ_enabled = -1, g_occ_sync = -1, g_occ_present = -1;
 static LONG64 g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_present_waits, g_occ_late;
 static LONG64 g_occ_unavailable;
 static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % OCC_MAX)); g_occ_open = 0; } }
-static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
+static void pass_end_at(int caller_line) {
+    if (!R.in_pass) return;
+    Tex *trace_t = R.ncol ? R.col[0].tex : NULL;
+    if (copylog_frame() == nvn_front_frame_next())
+        printf("nvn_vk_passend: frame %lld caller line %d thread %lu recording %d slot %d serial %llu cmd %p tex %p fmt 0x%x %dx%d submitting %d\n",
+               (long long)nvn_front_frame_next(), caller_line, (unsigned long)GetCurrentThreadId(), R.recording, R.cur,
+               (unsigned long long)R.serial, (void *)R.cmd, (void *)trace_t, trace_t ? (unsigned)trace_t->b.format : 0,
+               trace_t ? trace_t->b.width : 0, trace_t ? trace_t->b.height : 0, g_cmd_submitting);
+    occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0;
+    if (g_cmd_submitting && passshot_frame()) {
+        g_ps_deferred_frame = passshot_frame_number();
+        if (copylog_frame() == g_ps_deferred_frame)
+            printf("nvn_vk_passend: frame %lld passshot deferred until queue submission completes\n", (long long)g_ps_deferred_frame);
+    } else pass_shot();
+}
+#define pass_end() pass_end_at(__LINE__)
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 /* report timestamps, the clock nvn_gl.c's now_ns uses (performance counter in nanoseconds) */
@@ -372,7 +391,9 @@ static void cmd_begin(void) {
 /* Ends the command buffer being recorded and gives it to the queue. Returns its number (the last one when nothing was recorded). */
 static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (!R.recording) { if (!wait && !signal) return R.serial; cmd_begin(); }
+    g_cmd_submitting++;
     pass_end();
+    g_cmd_submitting--;
     Slot *s = &R.slot[R.cur];
     if (g_ts_on > 0) vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_ts_pool, (uint32_t)R.cur * 2 + 1);
     VKC(vkEndCommandBuffer(s->cmd));
@@ -386,6 +407,13 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     s->pending = 1; s->serial = ++R.serial;
     s->rlap1 = R.ring_lap; s->rpos1 = R.ring_pos;
     R.recording = 0; R.cmd = NULL; R.flushes++;
+    if (g_ps_deferred_frame >= 0) {
+        g_ps_frame_override = g_ps_deferred_frame; g_ps_deferred_frame = -1;
+        if (copylog_frame() == g_ps_frame_override)
+            printf("nvn_vk_passend: frame %lld passshot after queue submission\n", (long long)g_ps_frame_override);
+        pass_shot();
+        g_ps_frame_override = -1;
+    }
     return R.serial;
 }
 static void cmd_wait_all(void) { cmd_submit(NULL, NULL); for (int i = 0; i < NSLOT; i++) slot_wait(&R.slot[i]); R.done = R.serial; }
@@ -3044,7 +3072,7 @@ static void pass_shot(void) {
     if (want < 0 || logonly || busy || !R.ncol || !R.col[0].tex || !R.col[0].tex->vk) return;
     static long long last_frame = -1;
     char pre[24] = "";                             /* "<frame>_" before the pass number when a range is captured */
-    if (nvn_front_frame_next() != last_frame) { last_frame = nvn_front_frame_next(); n = 0; }
+    if (passshot_frame_number() != last_frame) { last_frame = passshot_frame_number(); n = 0; }
     if (passshot_range()) snprintf(pre, sizeof pre, "%lld_", last_frame);
     Tex *t = R.col[0].tex;
     VTex *vt = t->vk;
