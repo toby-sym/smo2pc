@@ -636,6 +636,14 @@ static void vt_layout(VTex *vt, VkImageLayout to) {
     image_barrier(vt->img, vt->aspect, vt->layout, to);
     vt->layout = to;
 }
+/* Repeated writes in TRANSFER_DST do not change layout, so vt_layout alone cannot order them. */
+static void vt_transfer_dst(VTex *vt) {
+    if (vt->layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        pass_end();
+        cmd_begin();
+        image_barrier(vt->img, vt->aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    } else vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+}
 /* nvnCommandBufferBarrier with ORDER_FRAGMENTS (2) / ORDER_FRAGMENTS_TILED (4): the draws after it read what
  * the draws before it rendered (a texture that is also a render target of the pass, or was one of the pass before
  * without a change of layout, e.g. GENERAL). The OpenGL path answers with glTextureBarrier; here the pass is ended and
@@ -878,9 +886,9 @@ static void rs_upload(VTex *vt, int level, int layer, uint64_t off, uint32_t row
     c.bufferOffset = off; c.bufferRowLength = rowlen; c.bufferImageHeight = rows;
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
     c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = 1;
-    vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vt_transfer_dst(tmp);
     vkCmdCopyBufferToImage(R.cmd, R.ring, tmp->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-    vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); vt_transfer_dst(vt);
     b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1;
     b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.dstSubresource.mipLevel = (uint32_t)level; b.dstSubresource.baseArrayLayer = (uint32_t)layer; b.dstSubresource.layerCount = 1;
     b.srcOffsets[1].x = w; b.srcOffsets[1].y = h; b.srcOffsets[1].z = 1;
@@ -914,7 +922,7 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
         R.upload_bytes += (LONG64)size;
         return;
     }
-    vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vt_transfer_dst(vt);
     VkBufferImageCopy c;
     memset(&c, 0, sizeof c);
     c.bufferOffset = off;
@@ -1111,10 +1119,16 @@ static VkImageView vt_view(VTex *vt, const EView *e, int dim, int attach) {
     for (VView *n = vt->views; n; n = n->next) if (n->vtype == dim && n->attach == attach && !memcmp(&n->e, e, sizeof *e)) return n->view;
     VView *n = calloc(1, sizeof *n);
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    VkImageViewUsageCreateInfo ui = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     static const VkComponentSwizzle sw[6] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
     int ex, dec;
     n->e = *e; n->vtype = dim; n->attach = attach;
     ci.image = vt->img; ci.format = vt->fmt;
+    if (vt->storage) {
+        ui.usage = attach == 2 ? VK_IMAGE_USAGE_STORAGE_BIT : attach ?
+            (vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) : VK_IMAGE_USAGE_SAMPLED_BIT;
+        ci.pNext = &ui;
+    }
     if (e->format != vt->t->b.format && vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT && !vt->decode && !vt->expand) { VkFormat f = tex_vkfmt(e->format, &ex, &dec); if (f && !ex && !dec && fmt_aspect(f) == VK_IMAGE_ASPECT_COLOR_BIT) ci.format = f; }
     if (attach) {
         ci.viewType = VK_IMAGE_VIEW_TYPE_2D; ci.subresourceRange.aspectMask = vt->aspect;
@@ -1871,8 +1885,10 @@ static VkImageView vt_storage_view(VTex *vt, const EView *e, int ty, VkFormat fm
     for (VView *n = vt->views; n; n = n->next) if (n->attach == 2 && n->vtype == ty && !memcmp(&n->e, &key, sizeof key)) return n->view;
     VView *n = calloc(1, sizeof *n);
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    VkImageViewUsageCreateInfo ui = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     n->e = key; n->vtype = ty; n->attach = 2;
     ci.image = vt->img; ci.format = fmt; ci.viewType = vtype[ty];
+    ui.usage = VK_IMAGE_USAGE_STORAGE_BIT; ci.pNext = &ui;
     ci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ci.subresourceRange.baseMipLevel = (uint32_t)e->lvl0; ci.subresourceRange.levelCount = 1;
     ci.subresourceRange.baseArrayLayer = vt->is3d ? 0 : (uint32_t)e->lay0; ci.subresourceRange.layerCount = vt->is3d ? 1 : (uint32_t)key.nlay;
     VkResult r = vkCreateImageView(V.device, &ci, NULL, &n->view);
@@ -2105,11 +2121,12 @@ static int draw_prepare(unsigned prim) {
         VStage *v = sv[s];
         if (!v) continue;
         Stage *st = &R.prog[s]->st[s];
-        for (unsigned n = 1; n < 18; n++) {
+        for (unsigned n = 0; n < 18; n++) {
             if (!(v->cbufs >> n & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
-            if (n == 2) { b->off = c2_ring(s); b->size = sizeof R.c2[s]; }
+            if (n == 0) b->zero = 1;
+            else if (n == 2) { b->off = c2_ring(s); b->size = sizeof R.c2[s]; }
             else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size); }
             else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b);
             else b->zero = 1;
@@ -2226,7 +2243,7 @@ static int draw_prepare(unsigned prim) {
         for (int s = 0; s < 3; s++) {
             VStage *v = sv[s];
             if (!v) continue;
-            for (unsigned n = 1; n < 34; n++) {
+            for (unsigned n = 0; n < 34; n++) {
                 unsigned bit = n < 18 ? v->cbufs >> n & 1 : v->ssbos >> (n - 18) & 1;
                 if (!bit) continue;
                 BufRef *b = &bufs[ib];
@@ -2360,7 +2377,7 @@ static void write_region(Tex *t, const View *vp, const int *r, const void *data,
     uint64_t off = ring_raw(data, size);
     pass_end(); cmd_begin();
     if (vt->rs) { rs_upload(vt, level, layer, off, (uint32_t)rowlen, (uint32_t)rows, r[0], r[1], r[3], r[4]); t->gpu_written = 1; t->uploaded = 1; return; }      /* */
-    vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vt_transfer_dst(vt);
     VkBufferImageCopy c;
     memset(&c, 0, sizeof c);
     c.bufferOffset = off; c.bufferRowLength = (uint32_t)rowlen; c.bufferImageHeight = (uint32_t)rows;
@@ -2421,7 +2438,7 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
         if (b.srcOffsets[1].x <= b.srcOffsets[0].x) b.srcOffsets[1].x = b.srcOffsets[0].x + 1; if (b.srcOffsets[1].y <= b.srcOffsets[0].y) b.srcOffsets[1].y = b.srcOffsets[0].y + 1;
         if (b.srcOffsets[1].x > lw) { b.srcOffsets[0].x = lw - 1; b.srcOffsets[1].x = lw; } if (b.srcOffsets[1].y > lh) { b.srcOffsets[0].y = lh - 1; b.srcOffsets[1].y = lh; }
         b.dstOffsets[1].x = r[3]; b.dstOffsets[1].y = r[4]; b.dstOffsets[1].z = 1;
-        vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vt_transfer_dst(tmp);
         vkCmdBlitImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tmp->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, rs_filter(vt));
         vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         c.imageSubresource.mipLevel = 0; c.imageSubresource.baseArrayLayer = 0; c.imageSubresource.layerCount = 1; c.imageOffset.x = c.imageOffset.y = c.imageOffset.z = 0;
@@ -2518,7 +2535,7 @@ static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *
         mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         g_blit_same++;
-    } else { vt_layout(vs, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); vt_layout(vd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL); }
+    } else { vt_layout(vs, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); vt_transfer_dst(vd); }
     memset(&b, 0, sizeof b);
     b.srcSubresource.aspectMask = vs->aspect; b.srcSubresource.mipLevel = sv && (sv->set & 0x81) == 0x81 ? (uint32_t)sv->lvl0 : 0; b.srcSubresource.baseArrayLayer = sv && (sv->set & 0x82) == 0x82 && !vs->is3d ? (uint32_t)sv->lay0 : 0; b.srcSubresource.layerCount = 1;
     b.dstSubresource.aspectMask = vd->aspect; b.dstSubresource.mipLevel = dv && (dv->set & 0x81) == 0x81 ? (uint32_t)dv->lvl0 : 0; b.dstSubresource.baseArrayLayer = dv && (dv->set & 0x82) == 0x82 && !vd->is3d ? (uint32_t)dv->lay0 : 0; b.dstSubresource.layerCount = 1;
@@ -2937,7 +2954,7 @@ static void exec(const Cmd *m, int depth) {
         if (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !nvn_front_fmt(t->b.format, &f) || f.kind == 4 || vt->decode || vt->expand) { nvn_vk_missing("nvnCommandBufferClearTexture of a depth, compressed or 3-component texture"); break; }
         if (!whole || ((unsigned)a[4] & ((1u << comps) - 1)) != (1u << comps) - 1) { nvn_vk_missing("nvnCommandBufferClearTexture of a part of a level or with a partial channel mask"); break; }
         cmd_begin();
-        vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vt_transfer_dst(vt);
         VkImageSubresourceRange sr = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)level, 1, (uint32_t)(vt->is3d ? 0 : layer), 1};
         VkClearColorValue cv;
         memcpy(&cv, blob + 48, 16);
