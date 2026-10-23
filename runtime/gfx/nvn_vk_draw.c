@@ -1437,12 +1437,7 @@ static void set_dynamic_state(void) {
     vkCmdSetStencilReference(R.cmd, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)R.sref[0]); vkCmdSetStencilReference(R.cmd, VK_STENCIL_FACE_BACK_BIT, (uint32_t)R.sref[1]);
     { static int nocull = -1; if (nocull < 0) nocull = getenv("SMO_VK_DIAG_NOCULL") != NULL;      /* diagnosis only */
       vkCmdSetCullMode(R.cmd, nocull ? 0 : (R.poly[0] & 3)); }
-    {   /* A negative Vulkan viewport height reflects clip-space Y. Front-face tests use framebuffer winding,
-         * so reverse NVN's requested orientation too; otherwise back-face culling removes every triangle. */
-        VkFrontFace face = R.poly[1] ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
-        if (vp.height < 0.0f) face = face == VK_FRONT_FACE_COUNTER_CLOCKWISE ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        vkCmdSetFrontFace(R.cmd, face);
-    }
+    vkCmdSetFrontFace(R.cmd, R.poly[1] ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
     { static int nodepth = -1; if (nodepth < 0) nodepth = getenv("SMO_VK_DIAG_NODEPTH") != NULL;      /* diagnosis only */
       vkCmdSetDepthTestEnable(R.cmd, nodepth ? 0 : (d & 1)); vkCmdSetDepthWriteEnable(R.cmd, (d >> 1) & 1); }
     { unsigned f = (unsigned)(d >> 4) & 15; vkCmdSetDepthCompareOp(R.cmd, (VkCompareOp)(f >= 1 && f <= 8 ? f - 1 : 7)); }
