@@ -71,11 +71,17 @@ static void vkd_fail(const char *fmt, ...) {
 }
 #define DBG_ASSERT(c, ...) do { if (D.debug && !(c)) vkd_fail(__VA_ARGS__); } while (0)
 /* the pipeline-library mode. SMO_VK_GPL wins (0 = whole pipelines, without libraries; 1 = a library per
- * stage pair, a measurement mode; 2 = a library per stage + loading barrier); without it VK_GPL_DEFAULT. */
+ * stage pair, a measurement mode; 2 = a library per stage + loading barrier); otherwise the default below. */
 #ifndef VK_GPL_DEFAULT
-#define VK_GPL_DEFAULT 2                           /* on by default where the driver has the extension; -DVK_GPL_DEFAULT=0 or SMO_VK_GPL=0 for the old path */
+#define VK_GPL_DEFAULT 2                           /* default for eligible GPUs; -DVK_GPL_DEFAULT=0 or SMO_VK_GPL=0 selects whole pipelines */
 #endif
-static int vk_gpl_mode(void) { static int m = -1; if (m < 0) { const char *e = getenv("SMO_VK_GPL"); m = e && e[0] ? atoi(e) : VK_GPL_DEFAULT; } return m; }
+static int vk_gpl_default(void) {
+    /* On this Iris Xe, the advertised stage-library path left shader workers busy for minutes at startup.
+     * The whole-pipeline path reaches gameplay promptly; SMO_VK_GPL=2 remains available for measurement. */
+    if (V.props.vendorID == 0x8086 && V.props.deviceID == 0x46a6) return 0;
+    return VK_GPL_DEFAULT;
+}
+static int vk_gpl_mode(void) { static int m = -1; if (m < 0) { const char *e = getenv("SMO_VK_GPL"); m = e && e[0] ? atoi(e) : vk_gpl_default(); } return m; }
 
 /* ---------------------------------------------------------------- device features */
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext) {
@@ -120,8 +126,8 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
         int m = vk_gpl_mode();
         printf("nvn_vk_path: %s: %s (SMO_VK_GPL %s; default %d; SMO_VK_GPL=0 is the switch back to whole pipelines)\n",
                D.has_gpl && m >= 2 ? "STAGE LIBRARIES + loading barrier (a draw links, nothing is compiled near a scene)" : D.has_gpl ? "PAIR LIBRARIES (SMO_VK_GPL=1, a measurement mode)" : "WHOLE PIPELINES (made by the workers from the list of earlier runs; a first use can hold a frame)",
-               !m ? (e ? "turned off by SMO_VK_GPL=0" : "off by default in this build") : D.has_gpl ? (e ? "asked for by SMO_VK_GPL" : "the default: the driver has VK_EXT_graphics_pipeline_library, extended dynamic state 3 and dynamic vertex input") :
-               !D.ext_gpl ? "the driver has NO VK_EXT_graphics_pipeline_library: fallen back" : "the driver lacks extended dynamic state 3 or dynamic vertex input: fallen back", e ? e : "not set", VK_GPL_DEFAULT);
+               !m ? (e ? "turned off by SMO_VK_GPL=0" : "off by default for this device") : D.has_gpl ? (e ? "asked for by SMO_VK_GPL" : "the default: the driver has VK_EXT_graphics_pipeline_library, extended dynamic state 3 and dynamic vertex input") :
+               !D.ext_gpl ? "the driver has NO VK_EXT_graphics_pipeline_library: fallen back" : "the driver lacks extended dynamic state 3 or dynamic vertex input: fallen back", e ? e : "not set", vk_gpl_default());
     }
     if (!D.f13.dynamicRendering || !D.f13.synchronization2) vkd_fail("the device lacks dynamicRendering / synchronization2");
     if (!D.has_vids) nvn_vk_missing("a GPU without VK_EXT_vertex_input_dynamic_state (the vertex layout is not yet part of the pipeline key)");
@@ -578,7 +584,7 @@ struct VTex {
     VView *views; VTex *next, *prev;
 };
 /* ---- internal resolution scale (graphics.ini resolution_scale; SMO_VK_SCALE wins).
- * A texture of the screen class (2D, one layer, attachable, the game's size exactly 1920x1080 >> k, k = 0..6) gets an image
+ * A texture of the screen class (2D, one layer, attachable, the game's size about 16:9: rs_screen_class) gets an image
  * of round(size * scale); everything the game says in ITS pixels about such an image is converted where it is used:
  * viewport, scissor, clear rectangles, copy / blit / resolve / downsample regions, uploads and read-backs (through a
  * temporary image of the game's size), the crop of the present. The size table of the shaders (c2) and the regions the game
@@ -597,12 +603,16 @@ static float rs_scale(void) {
     return g_rs;
 }
 #define RS_ON (rs_scale() != 1.0f)
-static int rs_screen_class(int w, int h) { for (int k = 0; k < 7; k++) if (w == 1920 >> k && h == 1080 >> k) return 1; return 0; }
+/* The game's screen-sized targets (measured with SMO_VK_RTLOG): its window textures (1600 x 900), the title's and every stage's
+ * scene buffers (1600 x 900, 1440 x 810 in Cascade Kingdom, ...) and their halvings down to 11 x 6 are all about 16:9; every
+ * other target it makes is square, 2:1, 4:1 or upright (shadow and cube maps, look-up tables, icons). So the screen class is
+ * a width 1.65 to 1.9 times the height (the halvings' rounding makes 12 x 7 and 11 x 6). */
+static int rs_screen_class(int w, int h) { return w >= 8 && h >= 4 && w * 100 >= h * 165 && w * 100 <= h * 190; }
 /* A coordinate of the game's grid on a scaled image (nearest image texel edge, inside 0..max). */
 static int rs_edge(int v, float s, int max) { int r = (int)floorf((float)v * s + 0.5f); return r < 0 ? 0 : r > max ? max : r; }
 /* the textures of the game's window (nvn_gl.c win_initialize keeps the list; also noted here at every present).
  * SMO_VK_UI_NATIVE=1 (resolution scale, experiment): a window texture is NOT scaled, so what the game draws straight into it
- * (its last full-screen pass and the 2D interface after it) is drawn at the game's 1920x1080. */
+ * (its last full-screen pass and the 2D interface after it) is drawn at the game's own size (1600 x 900). */
 int nvn_front_tex_is_window(const Tex *t);
 static Tex *g_wintex[8];
 static LONG64 g_rs_mixed;
@@ -965,7 +975,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         vt->levels = nvn_front_tex_levels(t); vt->layers = nvn_front_tex_layers(t); vt->samples = b->samples > 1 ? b->samples : 1; vt->is3d = b->target == 2;
         if (b->target == 0 || b->target == 3) { ci.imageType = VK_IMAGE_TYPE_1D; vt->h = 1; if (b->target == 3) vt->layers = b->height > 0 && b->depth <= 1 ? b->height : vt->layers; }
         else ci.imageType = vt->is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-        if (RS_ON && (b->target == 1 || b->target == 5) && vt->layers == 1 && !vt->decode && rs_screen_class(vt->w, vt->h) && !(rs_ui_native() && wintex_is(t)) &&
+        if (RS_ON && (b->target == 1 || b->target == 4 || b->target == 5) && vt->layers == 1 && !vt->decode && rs_screen_class(vt->w, vt->h) && !(rs_ui_native() && wintex_is(t)) &&
             (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (f.kind != 4 && fmt_supported(vt->fmt, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)))) {      /* a screen-class target */
             int gw = vt->w, gh = vt->h, lv = 1;
             vt->w = (int)((float)gw * rs_scale() + 0.5f); vt->h = (int)((float)gh * rs_scale() + 0.5f);
@@ -1212,11 +1222,13 @@ static VkSampler sampler_get(const SamplerParams *p) {
 #include "nvn_vk_pipelines.c"                      /* stages, pipelines, workers */
 /* ---------------------------------------------------------------- passes */
 static int target_level(const TargetRef *r) { return (r->view.set & 0x81) == 0x81 ? r->view.lvl0 : 0; }
+static int target_format(const TargetRef *r) {
+    return !r->tex ? 0 : (r->view.set & 0x84) == 0x84 && r->view.format ? r->view.format : r->tex->b.format;
+}
 static VkImageView target_view(const TargetRef *r, VTex *vt) {
     EView e;
     eview_of(r->tex, vt, &r->view, &e);
-    memset(e.swz, 0, 4); e.nlvl = 1; e.nlay = 1; e.format = r->tex->b.format; e.target = 1; e.dsmode = 0;
-    if ((r->view.set & 0x84) == 0x84 && r->view.format) e.format = r->view.format;
+    memset(e.swz, 0, 4); e.nlvl = 1; e.nlay = 1; e.format = target_format(r); e.target = 1; e.dsmode = 0;
     return vt_view(vt, &e, -1, 1);
 }
 static int pass_begin(void) {
@@ -2064,8 +2076,8 @@ static int draw_prepare(unsigned prim) {
             static int want = -2;
             want = passshot_frame() ? 1 : -1;
             if (want >= 0)
-                printf("nvn_vk_draw: prim %u programs vs #%d fs #%d gs #%d target %p | viewport %s %.0f %.0f %.0f %.0f | scissor %s %d %d %d %d | pass %dx%d in_pass %d | cull %u discard %d render_off %d | chanmask %08x blend_on %x logic %u blend0 %u %u %u %u %u %u | ds %llx\n",
-                       prim, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1, R.prog[2] ? R.prog[2]->serial : -1, (void *)R.col[0].tex, R.have_viewport ? "set" : "default", R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3],
+                printf("nvn_vk_draw: prim %u programs vs #%d fs #%d gs #%d target %p fmt 0x%x (base 0x%x) | viewport %s %.0f %.0f %.0f %.0f | scissor %s %d %d %d %d | pass %dx%d in_pass %d | cull %u discard %d render_off %d | chanmask %08x blend_on %x logic %u blend0 %u %u %u %u %u %u | ds %llx\n",
+                       prim, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1, R.prog[2] ? R.prog[2]->serial : -1, (void *)R.col[0].tex, target_format(&R.col[0]), R.col[0].tex ? R.col[0].tex->b.format : 0, R.have_viewport ? "set" : "default", R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3],
                        R.have_scissor ? "set" : "default", R.scissor[0], R.scissor[1], R.scissor[2], R.scissor[3], R.pass_w, R.pass_h, R.in_pass,
                        (unsigned)(R.poly[0] & 3), R.rast_discard, R.render_off, R.chanmask, (unsigned)R.blend_on, (unsigned)R.logic,
                        R.blend[0][0], R.blend[0][1], R.blend[0][2], R.blend[0][3], R.blend[0][4], R.blend[0][5], (unsigned long long)R.ds);
@@ -2302,22 +2314,27 @@ static int draw_prepare(unsigned prim) {
     return 1;
 }
 
-/* The pass formats of a target set as the pipeline key holds them (also used by the look-ahead of nvn_vk_pipelines.c on targets
- * that are not bound yet). Returns 0 when one of the images does not exist yet. */
+/* The pass formats of a target set as the pipeline key holds them. The look-ahead calls this before first replay, when a
+ * target may not have a VTex yet; derive that image's format and sample count from its NVN texture builder without making it. */
+static VkFormat pkey_target_format(Tex *t, int *samples) {
+    VTex *vt = t->vk;
+    if (vt) { *samples = vt->samples; return vt->fmt; }
+    int expand = 0, decode = 0;
+    VkFormat f = tex_vkfmt(t->b.format, &expand, &decode);
+    *samples = t->b.samples > 1 ? t->b.samples : 1;
+    return f ? f : VK_FORMAT_R8G8B8A8_UNORM;       /* vt_get uses the same fallback after reporting an unsupported format */
+}
 static int pkey_targets_of(PKey *k, int ncol, const TargetRef *col, const TargetRef *depth) {
-    int all = 1;
     k->ncolor = (uint8_t)ncol; k->samples = 1;
     for (int i = 0; i < ncol; i++) {
         if (!col[i].tex) continue;
-        VTex *vt = col[i].tex->vk;
-        int ex, dec;
-        if (!vt) { all = 0; continue; }
-        VkFormat f = vt->fmt;
-        if ((col[i].view.set & 0x84) == 0x84 && col[i].view.format) { VkFormat f2 = tex_vkfmt(col[i].view.format, &ex, &dec); if (f2 && !ex && !dec) f = f2; }
-        k->cfmt[i] = (int32_t)f; k->samples = (uint8_t)vt->samples;
+        int samples;
+        VkFormat f = pkey_target_format(col[i].tex, &samples);
+        if ((col[i].view.set & 0x84) == 0x84 && col[i].view.format) { int ex, dec; VkFormat f2 = tex_vkfmt(col[i].view.format, &ex, &dec); if (f2 && !ex && !dec) f = f2; }
+        k->cfmt[i] = (int32_t)f; k->samples = (uint8_t)samples;
     }
-    if (depth->tex) { VTex *vt = depth->tex->vk; if (!vt) all = 0; else { k->dfmt = (int32_t)vt->fmt; k->samples = (uint8_t)vt->samples; } }
-    return all;
+    if (depth->tex) { int samples; k->dfmt = (int32_t)pkey_target_format(depth->tex, &samples); k->samples = (uint8_t)samples; }
+    return 1;
 }
 static void pkey_targets(PKey *k) { pkey_targets_of(k, R.ncol, R.col, &R.depth); }
 /* ClearDepthStencil with a stencil mask that is not all bits: Vulkan's clears have no mask, so one triangle over the
@@ -2718,12 +2735,11 @@ static void exec(const Cmd *m, int depth) {
             R.nvn_tex[stage][u] = h;
             if (nvn_front_handle(R.tpool, R.spool, h, &t, &v, &sp) & 1) {      /* what TXQ reports, and whether the shader must use an integer sampler (resolve_handle's rules) */
                 int glevels = nvn_front_tex_levels(t), l0 = (v.set & 0x81) == 0x81 ? v.lvl0 : 0, nl = (v.set & 0x81) == 0x81 && v.nlvl > 0 ? v.nlvl : glevels - l0, is3d = t->b.target == 2;
-                int layers = (v.set & 0x82) == 0x82 && v.nlay > 0 ? v.nlay : nvn_front_tex_layers(t), nf = (v.set & 0x84) == 0x84 && v.format ? v.format : t->b.format, k = nf >= 0x6D ? nf - 0x6D : (nf - 1) % 12;
+                int layers = (v.set & 0x82) == 0x82 && v.nlay > 0 ? v.nlay : nvn_front_tex_layers(t), nf = (v.set & 0x84) == 0x84 && v.format ? v.format : t->b.format;
                 dims[0] = (uint32_t)lvl_(t->b.width, l0); dims[1] = (uint32_t)lvl_(t->b.height, l0);
                 dims[2] = is3d ? (uint32_t)lvl_(t->b.depth, l0) : (uint32_t)(t->b.target == 9 ? layers / 6 : layers);
                 dims[3] = (uint32_t)(nl > 0 ? nl : 1) | ((uint32_t)is3d << 16);
-                if (((nf >= 1 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) && (k == 2 || k == 3 || k == 7 || k == 8 || k == 10 || k == 11)) isint = k == 3 || k == 8 || k == 11 ? 2 : 1;
-                if (nf == 0x3E) isint = 1;
+                isint = scan_texture_int_type(t, &v);
             }
             if (memcmp(&R.c2[stage][48 + 2 * u], dims, 16)) { memcpy(&R.c2[stage][48 + 2 * u], dims, 16); g_c2r[stage].valid = 0; }
             R.tex_int[stage] = (R.tex_int[stage] & ~(1u << u)) | ((uint32_t)(isint != 0) << u);
@@ -3123,8 +3139,9 @@ static void pass_shot(void) {
     if (passshot_range()) snprintf(pre, sizeof pre, "%lld_", last_frame);
     Tex *t = R.col[0].tex;
     VTex *vt = t->vk;
-    int half4 = t->b.format == 0x29 && vt->bpb == 8;      /* RGBA16F, shown clamped to 0..1 (alpha too) */
-    int half1 = t->b.format == 0x5 && vt->bpb == 2;       /* R16F (linear depth, shadow maps): raw dump + min/max/mean */
+    int format = target_format(&R.col[0]);             /* decode the bits written through the attachment view */
+    int half4 = format == 0x29 && vt->bpb == 8;         /* RGBA16F, shown clamped to 0..1 (alpha too) */
+    int half1 = format == 0x5 && vt->bpb == 2;          /* R16F (linear depth, shadow maps): raw dump + min/max/mean */
     int level = target_level(&R.col[0]);
     View *view = &R.col[0].view;
     if (half1) {
@@ -3138,7 +3155,7 @@ static void pass_shot(void) {
         }
         free(hp); n++; return;
     }
-    if ((vt->bpb != 4 && !half4) || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { printf("nvn_vk_pass: pass %d: colour format 0x%x not captured\n", n++, (unsigned)t->b.format); return; }
+    if ((vt->bpb != 4 && !half4) || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { printf("nvn_vk_pass: pass %d: colour format 0x%x not captured\n", n++, (unsigned)format); return; }
     busy = 1;
     int w = vt->rs ? lvl_(t->b.width, level) : lvl_(vt->w, level), h = vt->rs ? lvl_(t->b.height, level) : lvl_(vt->h, level), rr[6] = {0, 0, 0, w, h, 1};
     uint8_t *px = malloc((size_t)w * h * 4);
@@ -3158,7 +3175,7 @@ static void pass_shot(void) {
         free(hp);
     } else if (px) got = read_region(t, view, rr, px, 0, 0) != 0;
     if (got) {
-        int ten = t->b.format == 0x3d || t->b.format == 0x3e, ufloat11 = t->b.format == 0x3f;
+        int ten = format == 0x3d || format == 0x3e, ufloat11 = format == 0x3f;
         long long lit = 0, alpha_hist[4] = {0, 0, 0, 0}; double sum[3] = {0, 0, 0};
         if (ufloat11) printf("nvn_vk_pass: pass %d: alpha n/a (packed R11G11B10F)\n", n);
         else {
@@ -3168,7 +3185,7 @@ static void pass_shot(void) {
         uint32_t row = ((uint32_t)w * 3 + 3) & ~3u, size = 54 + row * (uint32_t)h, v;
         char path[300];
         const char *dir = getenv("SMO_SHOT_DIR");
-        snprintf(path, sizeof path, "%s%spass_%s%03d_%02x.bmp", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)t->b.format);
+        snprintf(path, sizeof path, "%s%spass_%s%03d_%02x.bmp", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)format);
         FILE *f = fopen(path, "wb");
         uint8_t head[54] = {'B', 'M'}, *rowb = calloc(1, row);
         memcpy(head + 2, &size, 4); v = 54; memcpy(head + 10, &v, 4); v = 40; memcpy(head + 14, &v, 4); memcpy(head + 18, &w, 4); memcpy(head + 22, &h, 4); head[26] = 1; head[28] = 24;
@@ -3188,10 +3205,10 @@ static void pass_shot(void) {
         if (f) fclose(f);
         free(rowb);
         if (getenv("SMO_VK_PASSSHOT_RAW")) {         /* debug aid: the texels as read (4 bytes each, rows top first), for alpha and exact values */
-            char rp[320]; snprintf(rp, sizeof rp, "%s%spass_%s%03d_%02x_%dx%d.raw", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)t->b.format, w, h);
+            char rp[320]; snprintf(rp, sizeof rp, "%s%spass_%s%03d_%02x_%dx%d.raw", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)format, w, h);
             FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(px, 4, (size_t)w * h, fr); fclose(fr); }
         }
-        printf("nvn_vk_pass: pass %d: %dx%d mip %d format 0x%x: %.1f%% not black, mean %.1f %.1f %.1f -> %s\n", n, w, h, level, (unsigned)t->b.format,
+        printf("nvn_vk_pass: pass %d: %dx%d mip %d format 0x%x (base 0x%x, tex %p, image %p): %.1f%% not black, mean %.1f %.1f %.1f -> %s\n", n, w, h, level, (unsigned)format, (unsigned)t->b.format, (void *)t, (void *)vt->img,
                100.0 * (double)lit / ((double)w * h), sum[0] / ((double)w * h), sum[1] / ((double)w * h), sum[2] / ((double)w * h), path);
     }
     free(px);
@@ -3674,8 +3691,8 @@ static void vkd_init(void) {
     prewarm_start();
     wd_start();
     printf("nvn_vk: drawing part ready: %d command buffers in flight, stream ring %llu MB, %u memory types; debug checks %s\n", NSLOT, (unsigned long long)(R.ring_size >> 20), (unsigned)D.mp.memoryTypeCount, D.debug ? "on" : "off (SMO_VK_DEBUG=1)");
-    if (RS_ON) printf("nvn_vk_scale: internal resolution scale %.3f (%s): screen-class targets are made at %d x %d instead of 1920 x 1080; fragment stages are another translation\n",
-                      (double)rs_scale(), getenv("SMO_VK_SCALE") ? "SMO_VK_SCALE" : "graphics.ini", (int)(1920.0f * rs_scale() + 0.5f), (int)(1080.0f * rs_scale() + 0.5f));
+    if (RS_ON) printf("nvn_vk_scale: internal resolution scale %.3f (%s): screen-class targets are made at that scale (the window's picture %d x %d instead of 1600 x 900); fragment stages are another translation\n",
+                      (double)rs_scale(), getenv("SMO_VK_SCALE") ? "SMO_VK_SCALE" : "graphics.ini", (int)(1600.0f * rs_scale() + 0.5f), (int)(900.0f * rs_scale() + 0.5f));
     fflush(stdout);
 }
 static int frstat_cmp(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }

@@ -13,6 +13,7 @@
  *     sample shading): few keys per pair, which is what makes the prediction possible.
  * One lock (g_sh_lock) guards the stage table, the pipeline table, the signature / pair tables and the job queue. */
 #include <psapi.h>
+#include <stdint.h>
 typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
 typedef struct VStage {
     uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
@@ -27,7 +28,10 @@ typedef struct VStage {
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* SMO_VK_GPL=2: the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
     uint64_t spv; int mod_users, mod_rel;          /* spv: name of the stage's SPIR-V file; the module is used by mod_users threads now and may be released (mod_rel) once its library or compute pipeline is made (stage_mod_get) */
 } VStage;
-#define MX_VK_VERSION 10u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
+/* Version 11 discards stages made before the Vulkan subgroup intrinsics and the
+ * 32-bit implementations of SHF / LEA.HI. Loading those records bypasses the
+ * translator and can restore SPIR-V capabilities the device does not enable. */
+#define MX_VK_VERSION 11u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
@@ -464,8 +468,8 @@ typedef struct PairLib { VStage *vs, *fs; uint8_t samples, sshade; volatile LONG
 static PairLib *g_plib[1024];
 static CRITICAL_SECTION g_gpl_lock;
 static volatile LONG g_in_scene;
-static struct { PKey k; VkPipeline lib; } g_olib[128];
-static int g_nolib;
+static struct { PKey k; VkPipeline lib; } *g_olib;
+static size_t g_nolib, g_olib_cap;
 static VkPipeline g_vilib[3];
 static LONG64 g_gpl_made, g_gpl_made_tk, g_gpl_draw, g_gpl_draw_tk, g_gpl_draw_max, g_gpl_wait, g_gpl_wait_tk, g_gpl_link, g_gpl_link_tk, g_gpl_link_max, g_gpl_dlink, g_gpl_dlink_tk, g_gpl_dlink_max, g_gpl_dlink_scene;
 static DWORD g_render_tid;
@@ -579,10 +583,16 @@ static VkPipeline gpl_olib(const PKey *k0) {
     PKey k = *k0;
     k.vs = k.fs = 0; k.topo_class = 0;
     EnterCriticalSection(&g_gpl_lock);
-    int i;
+    size_t i;
     for (i = 0; i < g_nolib; i++) if (!memcmp(&g_olib[i].k, &k, sizeof k)) break;
     if (i == g_nolib) {
-        if (g_nolib == 128) vkd_fail("more than 128 pass signatures (fragment output libraries)");
+        if (g_nolib == g_olib_cap) {
+            size_t cap = g_olib_cap ? g_olib_cap * 2 : 128;
+            if (cap < g_olib_cap || cap > SIZE_MAX / sizeof *g_olib) vkd_fail("too many pass signatures (fragment output libraries)");
+            void *p = realloc(g_olib, cap * sizeof *g_olib);
+            if (!p) vkd_fail("could not allocate %llu pass signatures (fragment output libraries)", (unsigned long long)cap);
+            g_olib = p; g_olib_cap = cap;
+        }
         VkPipelineMultisampleStateCreateInfo ms; VkSampleMask smask;
         gpl_ms(&ms, &smask, k.samples, k.sshade);
         VkPipelineColorBlendAttachmentState ba[8];
@@ -716,8 +726,8 @@ static void gpl_destroy(void) {
     for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i]; v; v = v->next) { if (v->lib) { vkDestroyPipeline(V.device, v->lib, NULL); v->lib = NULL; } if (v->lib2) { vkDestroyPipeline(V.device, v->lib2, NULL); v->lib2 = NULL; } }
     if (g_ulayout) { vkDestroyPipelineLayout(V.device, g_ulayout, NULL); vkDestroyDescriptorSetLayout(V.device, g_udl[0], NULL); vkDestroyDescriptorSetLayout(V.device, g_udl[1], NULL); g_ulayout = NULL; }
     for (int i = 0; i < 1024; i++) for (PairLib *l = g_plib[i], *n; l; l = n) { n = l->next; if (l->lib) vkDestroyPipeline(V.device, l->lib, NULL); if (l->layout) vkDestroyPipelineLayout(V.device, l->layout, NULL); for (int k = 0; k < 2; k++) if (l->dl[k]) vkDestroyDescriptorSetLayout(V.device, l->dl[k], NULL); free(l); g_plib[i] = NULL; }
-    for (int i = 0; i < g_nolib; i++) vkDestroyPipeline(V.device, g_olib[i].lib, NULL);
-    g_nolib = 0;
+    for (size_t i = 0; i < g_nolib; i++) vkDestroyPipeline(V.device, g_olib[i].lib, NULL);
+    free(g_olib); g_olib = NULL; g_nolib = g_olib_cap = 0;
     for (int i = 0; i < 3; i++) if (g_vilib[i]) { vkDestroyPipeline(V.device, g_vilib[i], NULL); g_vilib[i] = NULL; }
 }
 /* A pipeline linked at once from libraries is not optimised across its stages (measured by ssbu-recomp in Super Smash Bros. Ultimate on
@@ -1517,8 +1527,19 @@ static void prewarm_start(void) {
  * combination not met before whose stages or pipeline do not exist goes to the FRONT of the worker queue; the replay that
  * follows then finds them made, waits for the one being made, or makes a queued one itself: the work of a frame that needs
  * many new pipelines at once (the first frame of a new scene) is spread over all cores instead of done one by one at the draws.
- * Not followed: integer texture formats (taken as bound now) and, without extended dynamic state 3, anything. */
-typedef struct { Prog *prog[2], *gprog /* a geometry stage is bound (its draws are not followed: gs_pipe_get) */; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
+ * It follows texture-pool and texture-bind commands because integer sampler types specialize the stage. Without extended
+ * dynamic state 3, blend and raster state also change the key and the batch scan is disabled. */
+static int scan_texture_int_type(const Tex *t, const View *v) {
+    if (!t || !v || t->dead) return 0;
+    int nf = (v->set & 0x84) == 0x84 && v->format ? v->format : t->b.format;
+    int k = nf >= 0x6D ? nf - 0x6D : (nf - 1) % 12;
+    if (((nf >= 1 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) &&
+        (k == 2 || k == 3 || k == 7 || k == 8 || k == 10 || k == 11))
+        return k == 3 || k == 8 || k == 11 ? 2 : 1;
+    if (nf == 0x3E) return 1;
+    return 0;
+}
+typedef struct { Prog *prog[2], *gprog /* a geometry stage is bound (its draws are not followed: gs_pipe_get) */; TexPool *tpool; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], tex_int[6], tex_sint[6], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
 static uint64_t g_scan_seen[8192];
 static void scan_sig(Scan *s) {
     memset(&s->sig, 0, sizeof s->sig);
@@ -1527,6 +1548,7 @@ static void scan_sig(Scan *s) {
 }
 static void scan_begin(Scan *s) {
     s->prog[0] = R.prog[0]; s->prog[1] = R.prog[1]; s->gprog = R.prog[2]; s->ncol = R.ncol; memcpy(s->col, R.col, sizeof s->col); s->depth = R.depth;
+    s->tpool = R.tpool; memcpy(s->tex_int, R.tex_int, sizeof s->tex_int); memcpy(s->tex_sint, R.tex_sint, sizeof s->tex_sint);
     s->nattr = R.nattr; memcpy(s->vattr, R.vattr, sizeof s->vattr); s->attr_new = 1; s->logic = R.logic;
     scan_sig(s);
 }
@@ -1543,13 +1565,13 @@ static void scan_draw(Scan *s, unsigned prim) {
             if (nf == 0x6A) { s->ints |= 1u << i; s->sints |= 1u << i; }
         }
     }
-    uint64_t w[6] = {(uint64_t)(uintptr_t)p0->st[0].code ^ ((uint64_t)p0->serial << 44), p1 ? (uint64_t)(uintptr_t)p1->st[1].code ^ ((uint64_t)p1->serial << 44) : 0, s->sig_tag, tclass[prim] | (uint64_t)s->logic << 8 | (uint64_t)(p1 ? p1->sample_shading & 1 : 0) << 16,
-                     (uint64_t)s->ints << 32 | s->sints, (uint64_t)R.tex_int[0] << 32 | R.tex_int[1]};
+    uint64_t w[7] = {(uint64_t)(uintptr_t)p0->st[0].code ^ ((uint64_t)p0->serial << 44), p1 ? (uint64_t)(uintptr_t)p1->st[1].code ^ ((uint64_t)p1->serial << 44) : 0, s->sig_tag, tclass[prim] | (uint64_t)s->logic << 8 | (uint64_t)(p1 ? p1->sample_shading & 1 : 0) << 16,
+                     (uint64_t)s->ints << 32 | s->sints, (uint64_t)s->tex_int[0] << 32 | s->tex_int[1], (uint64_t)s->tex_sint[0] << 32 | s->tex_sint[1]};
     uint64_t tag = fnv(0xcbf29ce484222325ULL, w, sizeof w) | 1;
     unsigned slot = (unsigned)(tag >> 20) & 8191;
     if (g_scan_seen[slot] == tag) return;
     g_scan_seen[slot] = tag;
-    uint32_t key0[4] = {s->ints, s->sints, R.tex_int[0], R.tex_sint[0]}, key1[4] = {0, 0, R.tex_int[1], R.tex_sint[1]};
+    uint32_t key0[4] = {s->ints, s->sints, s->tex_int[0], s->tex_sint[0]}, key1[4] = {0, 0, s->tex_int[1], s->tex_sint[1]};
     VStage *vs = p0->st[0].vk, *fs = p1 ? p1->st[1].vk : NULL;
     int fs_made = !p1 || (fs && fs->state == 2 && fs->fo == 0 && key_fits(1, key1, fs->key, fs->dep, fs->tex_units));
     int vs_made = fs_made && vs && vs->state == 2 && key_fits(0, key0, vs->key, vs->dep, vs->tex_units) && vs->fo == (fs && fs->ok ? fs->in_attr & ~(vs->out_attr & ~vs->fo) : 0);
@@ -1592,6 +1614,23 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
         const uint64_t *a = m->a;
         if (m->size < sizeof(Cmd)) break;
         switch (m->op) {
+        case OP_TEXPOOL: s->tpool = P(a[0]); break;
+        case OP_TEXTURES: {
+            int stage = (int)a[0] % 6, first = (int)a[1], count = (int)a[2];
+            for (int i = 0; i < count && first + i < 32; i++) {
+                uint64_t h;
+                Tex *t = NULL;
+                View v;
+                SamplerParams sp;
+                memcpy(&h, BLOB(m) + i * 8, sizeof h);
+                int isint = 0;
+                if (nvn_front_handle(s->tpool, NULL, h, &t, &v, &sp) & 1) isint = scan_texture_int_type(t, &v);
+                unsigned unit = (unsigned)(first + i);
+                s->tex_int[stage] = (s->tex_int[stage] & ~(1u << unit)) | ((uint32_t)(isint != 0) << unit);
+                s->tex_sint[stage] = (s->tex_sint[stage] & ~(1u << unit)) | ((uint32_t)(isint == 2) << unit);
+            }
+            break;
+        }
         case OP_PROGRAM: for (int st = 0; st < 2; st++) if (a[1] & (1u << st)) { Prog *p = P(a[0]); s->prog[st] = p && !p->dead && p->st[st].state ? p : NULL; }
             if (a[1] & 4u) { Prog *p = P(a[0]); s->gprog = p && !p->dead && p->st[2].state ? p : NULL; }
             break;
@@ -1607,6 +1646,24 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
         case OP_VATTR: s->nattr = (int)a[0] < 32 ? (int)a[0] : 32; memcpy(s->vattr, BLOB(m), (size_t)s->nattr * 4); s->attr_new = 1; break;
         case OP_COLOR: s->logic = ((const uint8_t *)&a[0])[1]; break;
         case OP_DRAW_ARRAYS: case OP_DRAW_ELEMENTS: scan_draw(s, (unsigned)a[0]); break;
+        case OP_DRAW_INDIRECT: {
+            unsigned n = (unsigned)a[4], stride = (unsigned)a[5];
+            int elements = (int)(a[6] & 1);
+            if (!stride) stride = elements ? 20 : 16;
+            if (a[6] & 2) {
+                uint64_t param = 0;
+                memcpy(&param, BLOB(m), sizeof param);
+                uint32_t cnt = 0;
+                if (param) memcpy(&cnt, P(param), sizeof cnt);  /* batch submit synced GPU-written draw counts before scanning */
+                if (cnt < n) n = cnt;
+            }
+            if (a[3] && n) for (unsigned i = 0; i < n; i++) {
+                uint32_t d[5] = {0};
+                memcpy(d, P(a[3] + (uint64_t)i * stride), elements ? 20 : 16);
+                if (d[0] && d[1]) scan_draw(s, (unsigned)a[0]);
+            }
+            break;
+        }
         case OP_CALL: for (int i = 0; i < (int)a[0]; i++) { uint64_t h; memcpy(&h, BLOB(m) + i * 8, 8); if (depth < 8) scan_list(h, depth + 1, s); } break;
         default: break;
         }
@@ -1635,9 +1692,9 @@ static void pipelines_report(void) {
     if (D.has_gpl) {
         double q = 1000.0 / (double)fq.QuadPart;
         printf("nvn_vk_gpl: pair libraries compiled by the workers: %lld (%.0f ms of worker time; %lld of them asked for as shared vertex stage x fragment stage without a program of its own: %d such fragment stages, %d shared vertex stages); "
-               "PAIR LIBRARY COMPILED AT A DRAW (a hold): %lld, %.1f ms, longest %.2f ms; waited for at a draw or by a worker: %lld, %.1f ms | pipelines LINKED at a draw from ready libraries: %lld (%lld in scene frames), %.1f ms in all, longest %.2f ms; linked by workers: %lld, %.0f ms; %d fragment output libraries\n",
+               "PAIR LIBRARY COMPILED AT A DRAW (a hold): %lld, %.1f ms, longest %.2f ms; waited for at a draw or by a worker: %lld, %.1f ms | pipelines LINKED at a draw from ready libraries: %lld (%lld in scene frames), %.1f ms in all, longest %.2f ms; linked by workers: %lld, %.0f ms; %llu fragment output libraries\n",
                (long long)g_gpl_made, (double)g_gpl_made_tk * q, (long long)g_gpl_cross, g_nfo, g_nshvs, (long long)g_gpl_draw, (double)g_gpl_draw_tk * q, (double)g_gpl_draw_max * q, (long long)g_gpl_wait, (double)g_gpl_wait_tk * q,
-               (long long)g_gpl_dlink, (long long)g_gpl_dlink_scene, (double)g_gpl_dlink_tk * q, (double)g_gpl_dlink_max * q, (long long)g_gpl_link, (double)g_gpl_link_tk * q, g_nolib);
+               (long long)g_gpl_dlink, (long long)g_gpl_dlink_scene, (double)g_gpl_dlink_tk * q, (double)g_gpl_dlink_max * q, (long long)g_gpl_link, (double)g_gpl_link_tk * q, (unsigned long long)g_nolib);
     }
     if (D.has_gpl) printf("nvn_vk_gpl: mode %s; pipelines linked again with optimisation by the workers: %lld of %lld queued, %.0f ms of worker time\n", gpl_sep() ? "2 (a library per stage)" : "1 (a library per stage pair)", (long long)g_gpl_opt_n, (long long)g_gpl_opt_q, (double)g_gpl_opt_tk * 1000.0 / (double)fq.QuadPart);
     printf("nvn_vk_skip: shader_wait = %s; draws left out because a stage or pipeline was not ready: %lld in %lld frames (stage not ready %lld, pipeline not ready %lld)\n", skip_on() ? "skip (near a scene)" : "hold (the default)", (long long)g_skip_n, (long long)g_skip_frames, (long long)g_skip_stage, (long long)g_skip_pipe);
