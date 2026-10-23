@@ -3123,10 +3123,12 @@ static void pass_shot(void) {
     VTex *vt = t->vk;
     int half4 = t->b.format == 0x29 && vt->bpb == 8;      /* RGBA16F, shown clamped to 0..1 (alpha too) */
     int half1 = t->b.format == 0x5 && vt->bpb == 2;       /* R16F (linear depth, shadow maps): raw dump + min/max/mean */
+    int level = target_level(&R.col[0]);
+    View *view = &R.col[0].view;
     if (half1) {
-        int w1 = vt->w, h1 = vt->h, r1[6] = {0, 0, 0, w1, h1, 1};
+        int w1 = vt->rs ? lvl_(t->b.width, level) : lvl_(vt->w, level), h1 = vt->rs ? lvl_(t->b.height, level) : lvl_(vt->h, level), r1[6] = {0, 0, 0, w1, h1, 1};
         uint16_t *hp = malloc((size_t)w1 * h1 * 2);
-        if (hp && read_region(t, NULL, r1, hp, 0, 0)) {
+        if (hp && read_region(t, view, r1, hp, 0, 0)) {
             double mn = 1e30, mx = -1e30, sm = 0;
             for (size_t k = 0; k < (size_t)w1 * h1; k++) { uint16_t hv = hp[k]; int ex = (hv >> 10) & 31, man = hv & 1023; float f = ex == 0 ? ldexpf((float)man, -24) : ex == 31 ? 65504.0f : ldexpf(1.0f + man / 1024.0f, ex - 15); if (hv & 0x8000) f = -f; if (f < mn) mn = f; if (f > mx) mx = f; sm += f; }
             printf("nvn_vk_pass: pass %d: %dx%d R16F min %g max %g mean %g\n", n, w1, h1, mn, mx, sm / ((double)w1 * h1));
@@ -3136,12 +3138,12 @@ static void pass_shot(void) {
     }
     if ((vt->bpb != 4 && !half4) || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { printf("nvn_vk_pass: pass %d: colour format 0x%x not captured\n", n++, (unsigned)t->b.format); return; }
     busy = 1;
-    int w = vt->rs ? t->b.width : vt->w, h = vt->rs ? t->b.height : vt->h, rr[6] = {0, 0, 0, w, h, 1};
+    int w = vt->rs ? lvl_(t->b.width, level) : lvl_(vt->w, level), h = vt->rs ? lvl_(t->b.height, level) : lvl_(vt->h, level), rr[6] = {0, 0, 0, w, h, 1};
     uint8_t *px = malloc((size_t)w * h * 4);
     int got = 0;
     if (px && half4) {
         uint16_t *hp = malloc((size_t)w * h * 8);
-        if (hp && read_region(t, NULL, rr, hp, 0, 0)) {
+        if (hp && read_region(t, view, rr, hp, 0, 0)) {
             got = 1;
             for (size_t k = 0; k < (size_t)w * h * 4; k++) {
                 uint16_t hv = hp[k]; int ex = (hv >> 10) & 31, man = hv & 1023;
@@ -3152,7 +3154,7 @@ static void pass_shot(void) {
             if (getenv("SMO_VK_PASSSHOT_RAW")) { char rp[320]; const char *dd = getenv("SMO_SHOT_DIR"); snprintf(rp, sizeof rp, "%s%spass_%s%03d_29_%dx%d.half", dd ? dd : "", dd ? "/" : "", pre, n, w, h); FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(hp, 8, (size_t)w * h, fr); fclose(fr); } }
         }
         free(hp);
-    } else if (px) got = read_region(t, NULL, rr, px, 0, 0) != 0;
+    } else if (px) got = read_region(t, view, rr, px, 0, 0) != 0;
     if (got) {
         int ten = t->b.format == 0x3d || t->b.format == 0x3e, ufloat11 = t->b.format == 0x3f;
         long long lit = 0, alpha_hist[4] = {0, 0, 0, 0}; double sum[3] = {0, 0, 0};
@@ -3187,7 +3189,7 @@ static void pass_shot(void) {
             char rp[320]; snprintf(rp, sizeof rp, "%s%spass_%s%03d_%02x_%dx%d.raw", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)t->b.format, w, h);
             FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(px, 4, (size_t)w * h, fr); fclose(fr); }
         }
-        printf("nvn_vk_pass: pass %d: %dx%d format 0x%x: %.1f%% not black, mean %.1f %.1f %.1f -> %s\n", n, w, h, (unsigned)t->b.format,
+        printf("nvn_vk_pass: pass %d: %dx%d mip %d format 0x%x: %.1f%% not black, mean %.1f %.1f %.1f -> %s\n", n, w, h, level, (unsigned)t->b.format,
                100.0 * (double)lit / ((double)w * h), sum[0] / ((double)w * h), sum[1] / ((double)w * h), sum[2] / ((double)w * h), path);
     }
     free(px);
