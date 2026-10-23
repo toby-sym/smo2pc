@@ -123,6 +123,8 @@ static uint64_t ssrc_hb(const SSrc *o) {
           const char *tag = !strcmp(d, "uv") ? "diag98uv" : "diag98sample";
           h = fnv(h, tag, strlen(tag));
       } }
+    { const char *d = getenv("SMO_VK_DUMP98VS");
+      if (o->stage == 0 && o->serial == 98 && d && atoi(d)) h = fnv(h, "dump98vs", 8); }
     return fnv(h, &ver, 4);
 }
 static VkShaderModule module_from_spv(uint64_t h) {              /* any thread; NULL when the file is not there */
@@ -249,11 +251,13 @@ static void vstage_build(VStage *v, const SSrc *src) {
     int diag98uv = s == 1 && src->serial == 98 && diag98 && !strcmp(diag98, "uv");
     int diag98sample = s == 1 && src->serial == 98 && diag98 && !strcmp(diag98, "sample");
     int diag98shader = diag98uv || diag98sample;
+    const char *dump98env = getenv("SMO_VK_DUMP98VS");
+    int dump98vs = s == 0 && src->serial == 98 && dump98env && atoi(dump98env);
     v->gprim = src->gprim;
     char path[128];
     StageRec r;
     snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), s, (unsigned long long)v->hb);
-    FILE *fp = diag98shader ? NULL : fopen(path, "rb");
+    FILE *fp = (diag98shader || dump98vs) ? NULL : fopen(path, "rb");
     if (fp) {
         VarRec e;
         while (!done && fread(&e, 1, sizeof e, fp) == sizeof e) {
@@ -319,7 +323,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
                 VarRec e;
                 v->key[0] &= v->dep; v->key[1] &= v->dep; v->key[2] &= v->tex_units; v->key[3] &= v->tex_units;
                 v->h = fnv(fnv(v->hb, v->key, 16), &v->fo, 4);
-                if (diag98shader) goto no_record;
+                if (diag98shader || dump98vs) goto no_record;
                 if (v->images) goto no_record;     /* a stage with images has no record (its images' formats and types are not in it; see above) */
                 memset(&r, 0, sizeof r);
                 r.magic = STAGEREC_MAGIC; r.stage = s; r.code_len = v->code_len; memcpy(r.key, v->key, 16); r.fo = v->fo; r.spv = spv_hash; r.hb = v->hb;
