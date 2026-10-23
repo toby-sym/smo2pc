@@ -205,11 +205,6 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
     bi.size = size; bi.usage = usage; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VKC(vkCreateBuffer(V.device, &bi, NULL, &b));
     vkGetBufferMemoryRequirements(V.device, b, &rq);
-    /* Diagnostic: isolate readbacks from the shared host-visible blocks. */
-    static int dedicated = -1;
-    if (dedicated < 0) { const char *e = getenv("SMO_VK_READ_DEDICATED"); dedicated = e && atoi(e); }
-    if (usage == VK_BUFFER_USAGE_TRANSFER_DST_BIT && dedicated && rq.size <= (16u << 20))
-        rq.size = (16u << 20) + 256;
     *mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1);
     VKC(vkBindBufferMemory(V.device, b, mem->mem, mem->off));
     return b;
@@ -1221,11 +1216,13 @@ static VkSampler sampler_get(const SamplerParams *p) {
 #include "nvn_vk_pipelines.c"                      /* stages, pipelines, workers */
 /* ---------------------------------------------------------------- passes */
 static int target_level(const TargetRef *r) { return (r->view.set & 0x81) == 0x81 ? r->view.lvl0 : 0; }
+static int target_format(const TargetRef *r) {
+    return !r->tex ? 0 : (r->view.set & 0x84) == 0x84 && r->view.format ? r->view.format : r->tex->b.format;
+}
 static VkImageView target_view(const TargetRef *r, VTex *vt) {
     EView e;
     eview_of(r->tex, vt, &r->view, &e);
-    memset(e.swz, 0, 4); e.nlvl = 1; e.nlay = 1; e.format = r->tex->b.format; e.target = 1; e.dsmode = 0;
-    if ((r->view.set & 0x84) == 0x84 && r->view.format) e.format = r->view.format;
+    memset(e.swz, 0, 4); e.nlvl = 1; e.nlay = 1; e.format = target_format(r); e.target = 1; e.dsmode = 0;
     return vt_view(vt, &e, -1, 1);
 }
 static int pass_begin(void) {
@@ -1396,20 +1393,6 @@ static void resolve_sampler(int s, VStage *v, int i) {
     if (r & 1) {
         VTex *vt = vt_get(t);
         EView e;
-        if (copylog_frame() == nvn_front_frame_next() && s == 1 && R.prog[s] && R.prog[s]->serial == 98 &&
-            t->b.width == 1600 && t->b.height == 900 && vt->bpb == 4) {
-            /* Compare the same texel in a tight one-pixel copy and a whole-image
-             * copy before the final sample. This also identifies the exact source
-             * image, rather than inferring it from the last pass's dimensions. */
-            uint32_t pixel = 0, *pixels = malloc((size_t)t->b.width * t->b.height * 4);
-            int one[6] = {800, 450, 0, 1, 1, 1}, whole[6] = {0, 0, 0, 1600, 900, 1};
-            int small_ok = read_region(t, &view, one, &pixel, 0, 0) != 0;
-            int whole_ok = pixels && read_region(t, &view, whole, pixels, 0, 0) != 0;
-            printf("nvn_vk_sample98: frame %lld tex %p image %p NVN 0x%x Vk %d center 800,450 one %d:%08x whole %d:%08x\n",
-                   (long long)nvn_front_frame_next(), (void *)t, (void *)vt->img, (unsigned)t->b.format, (int)vt->fmt,
-                   small_ok, pixel, whole_ok, whole_ok ? pixels[450 * 1600 + 800] : 0);
-            free(pixels);
-        }
         int attached = R.depth.tex == t, dim = v->smp[i].dim;
         for (int k = 0; k < R.ncol; k++) attached |= R.col[k].tex == t;
         eview_of(t, vt, &view, &e);
@@ -2087,8 +2070,8 @@ static int draw_prepare(unsigned prim) {
             static int want = -2;
             want = passshot_frame() ? 1 : -1;
             if (want >= 0)
-                printf("nvn_vk_draw: prim %u programs vs #%d fs #%d gs #%d target %p | viewport %s %.0f %.0f %.0f %.0f | scissor %s %d %d %d %d | pass %dx%d in_pass %d | cull %u discard %d render_off %d | chanmask %08x blend_on %x logic %u blend0 %u %u %u %u %u %u | ds %llx\n",
-                       prim, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1, R.prog[2] ? R.prog[2]->serial : -1, (void *)R.col[0].tex, R.have_viewport ? "set" : "default", R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3],
+                printf("nvn_vk_draw: prim %u programs vs #%d fs #%d gs #%d target %p fmt 0x%x (base 0x%x) | viewport %s %.0f %.0f %.0f %.0f | scissor %s %d %d %d %d | pass %dx%d in_pass %d | cull %u discard %d render_off %d | chanmask %08x blend_on %x logic %u blend0 %u %u %u %u %u %u | ds %llx\n",
+                       prim, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1, R.prog[2] ? R.prog[2]->serial : -1, (void *)R.col[0].tex, target_format(&R.col[0]), R.col[0].tex ? R.col[0].tex->b.format : 0, R.have_viewport ? "set" : "default", R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3],
                        R.have_scissor ? "set" : "default", R.scissor[0], R.scissor[1], R.scissor[2], R.scissor[3], R.pass_w, R.pass_h, R.in_pass,
                        (unsigned)(R.poly[0] & 3), R.rast_discard, R.render_off, R.chanmask, (unsigned)R.blend_on, (unsigned)R.logic,
                        R.blend[0][0], R.blend[0][1], R.blend[0][2], R.blend[0][3], R.blend[0][4], R.blend[0][5], (unsigned long long)R.ds);
@@ -2437,8 +2420,6 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
     if (!size) return 0;
     VMem mem;
     VkBuffer buf = vbuf_new(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mem);
-    int copy_trace = copylog_frame() == nvn_front_frame_next();
-    if (copy_trace) memset(mem.map, 0xcd, (size_t)size);
     VkBufferImageCopy c;
     pass_end(); cmd_begin();
     VkImageLayout was = vt->layout;
@@ -2475,13 +2456,6 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
     vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
     if (was != VK_IMAGE_LAYOUT_UNDEFINED) vt_layout(vt, was);
     cmd_wait_all();
-    if (copy_trace) {
-        VKC(vkDeviceWaitIdle(V.device));
-        uint32_t first = 0; memcpy(&first, mem.map, size < 4 ? (size_t)size : 4);
-        printf("nvn_vk_readcheck: tex %p image %p buffer %p memory %p+%llu map %p size %llu rect %d,%d %dx%d first %08x serial %llu done %llu\n",
-               (void *)t, (void *)vt->img, (void *)buf, (void *)mem.mem, (unsigned long long)mem.off, mem.map,
-               (unsigned long long)size, r[0], r[1], r[3], r[4], first, (unsigned long long)R.serial, (unsigned long long)R.done);
-    }
     if (copylog_frame() == nvn_front_frame_next() && t->b.format == 0x25 && vt->w == 1600 && vt->h == 900) {
         const uint8_t *p = mem.map;
         size_t pitch = (size_t)(rowlen ? rowlen : (uint64_t)r[3]), rows_out = (size_t)(rows ? rows : (uint64_t)r[4]);
@@ -3155,8 +3129,9 @@ static void pass_shot(void) {
     if (passshot_range()) snprintf(pre, sizeof pre, "%lld_", last_frame);
     Tex *t = R.col[0].tex;
     VTex *vt = t->vk;
-    int half4 = t->b.format == 0x29 && vt->bpb == 8;      /* RGBA16F, shown clamped to 0..1 (alpha too) */
-    int half1 = t->b.format == 0x5 && vt->bpb == 2;       /* R16F (linear depth, shadow maps): raw dump + min/max/mean */
+    int format = target_format(&R.col[0]);             /* decode the bits written through the attachment view */
+    int half4 = format == 0x29 && vt->bpb == 8;         /* RGBA16F, shown clamped to 0..1 (alpha too) */
+    int half1 = format == 0x5 && vt->bpb == 2;          /* R16F (linear depth, shadow maps): raw dump + min/max/mean */
     int level = target_level(&R.col[0]);
     View *view = &R.col[0].view;
     if (half1) {
@@ -3170,7 +3145,7 @@ static void pass_shot(void) {
         }
         free(hp); n++; return;
     }
-    if ((vt->bpb != 4 && !half4) || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { printf("nvn_vk_pass: pass %d: colour format 0x%x not captured\n", n++, (unsigned)t->b.format); return; }
+    if ((vt->bpb != 4 && !half4) || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { printf("nvn_vk_pass: pass %d: colour format 0x%x not captured\n", n++, (unsigned)format); return; }
     busy = 1;
     int w = vt->rs ? lvl_(t->b.width, level) : lvl_(vt->w, level), h = vt->rs ? lvl_(t->b.height, level) : lvl_(vt->h, level), rr[6] = {0, 0, 0, w, h, 1};
     uint8_t *px = malloc((size_t)w * h * 4);
@@ -3190,7 +3165,7 @@ static void pass_shot(void) {
         free(hp);
     } else if (px) got = read_region(t, view, rr, px, 0, 0) != 0;
     if (got) {
-        int ten = t->b.format == 0x3d || t->b.format == 0x3e, ufloat11 = t->b.format == 0x3f;
+        int ten = format == 0x3d || format == 0x3e, ufloat11 = format == 0x3f;
         long long lit = 0, alpha_hist[4] = {0, 0, 0, 0}; double sum[3] = {0, 0, 0};
         if (ufloat11) printf("nvn_vk_pass: pass %d: alpha n/a (packed R11G11B10F)\n", n);
         else {
@@ -3200,7 +3175,7 @@ static void pass_shot(void) {
         uint32_t row = ((uint32_t)w * 3 + 3) & ~3u, size = 54 + row * (uint32_t)h, v;
         char path[300];
         const char *dir = getenv("SMO_SHOT_DIR");
-        snprintf(path, sizeof path, "%s%spass_%s%03d_%02x.bmp", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)t->b.format);
+        snprintf(path, sizeof path, "%s%spass_%s%03d_%02x.bmp", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)format);
         FILE *f = fopen(path, "wb");
         uint8_t head[54] = {'B', 'M'}, *rowb = calloc(1, row);
         memcpy(head + 2, &size, 4); v = 54; memcpy(head + 10, &v, 4); v = 40; memcpy(head + 14, &v, 4); memcpy(head + 18, &w, 4); memcpy(head + 22, &h, 4); head[26] = 1; head[28] = 24;
@@ -3220,10 +3195,10 @@ static void pass_shot(void) {
         if (f) fclose(f);
         free(rowb);
         if (getenv("SMO_VK_PASSSHOT_RAW")) {         /* debug aid: the texels as read (4 bytes each, rows top first), for alpha and exact values */
-            char rp[320]; snprintf(rp, sizeof rp, "%s%spass_%s%03d_%02x_%dx%d.raw", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)t->b.format, w, h);
+            char rp[320]; snprintf(rp, sizeof rp, "%s%spass_%s%03d_%02x_%dx%d.raw", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)format, w, h);
             FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(px, 4, (size_t)w * h, fr); fclose(fr); }
         }
-        printf("nvn_vk_pass: pass %d: %dx%d mip %d format 0x%x: %.1f%% not black, mean %.1f %.1f %.1f -> %s\n", n, w, h, level, (unsigned)t->b.format,
+        printf("nvn_vk_pass: pass %d: %dx%d mip %d format 0x%x (base 0x%x, tex %p, image %p): %.1f%% not black, mean %.1f %.1f %.1f -> %s\n", n, w, h, level, (unsigned)format, (unsigned)t->b.format, (void *)t, (void *)vt->img,
                100.0 * (double)lit / ((double)w * h), sum[0] / ((double)w * h), sum[1] / ((double)w * h), sum[2] / ((double)w * h), path);
     }
     free(px);
