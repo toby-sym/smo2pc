@@ -1306,6 +1306,8 @@ static void resolve_sampler(int s, VStage *v, int i) {
                    s, u, (unsigned long long)handle, (r & 1) ? "live" : "NO TEXTURE", (void *)((r & 1) ? t : NULL),
                    (r & 1) ? (unsigned)t->b.format : 0u, (r & 1) ? t->b.width : 0, (r & 1) ? t->b.height : 0, (void *)((r & 1) ? t->mem : NULL),
                    (r & 1) ? t->gpu_written : -1, (void *)c0, c0 ? (unsigned)c0->b.format : 0u, (void *)(c0 ? c0->mem : NULL));
+            if (r & 1) printf("nvn_vk_bind:   view set 0x%x format 0x%x swizzle %u%u%u%u | sampler min %u mag %u wrap %u/%u/%u\n",
+                              view.set, view.format, view.swz[0], view.swz[1], view.swz[2], view.swz[3], sp.min, sp.mag, sp.ws, sp.wt, sp.wr);
             if (!(r & 1) && handle) printf("nvn_vk_bind:   why: %s\n", nvn_front_handle_why(R.tpool, handle));
             if ((r & 1) && t->b.target == 2 && t->b.format == 0x3f && t->b.width * t->b.height * t->b.depth <= 4096) {      /* debug aid: a small R11G11B10F volume (colour-grading LUT): its contents */
                 static uint32_t px[4096];
@@ -1335,6 +1337,10 @@ static void resolve_sampler(int s, VStage *v, int i) {
         int attached = R.depth.tex == t, dim = v->smp[i].dim;
         for (int k = 0; k < R.ncol; k++) attached |= R.col[k].tex == t;
         eview_of(t, vt, &view, &e);
+        if (passshot_frame() && R.prog[s] && R.prog[s]->serial == 98)
+            printf("nvn_vk_bind: effective view target %d format 0x%x swizzle %u%u%u%u levels %d+%d layers %d+%d | base swizzle %u%u%u%u, VkFormat %d image %p layout %d\n",
+                   e.target, e.format, e.swz[0], e.swz[1], e.swz[2], e.swz[3], e.lvl0, e.nlvl, e.lay0, e.nlay,
+                   t->b.swz[0], t->b.swz[1], t->b.swz[2], t->b.swz[3], (int)vt->fmt, (void *)vt->img, (int)vt->layout);
         int have = target_dim(e.target);
         int ok = have == dim || (dim == DIM_2D && (have == DIM_2DA || have == DIM_CUBE || have == DIM_CUBEA)) || (dim == DIM_2DA && (have == DIM_2D || have == DIM_CUBE || have == DIM_CUBEA)) ||
                  (dim == DIM_CUBE && have == DIM_CUBEA) || (dim == DIM_CUBEA && have == DIM_CUBE) || (dim == DIM_1D && have == DIM_1DA) || (dim == DIM_1DA && have == DIM_1D) ||
@@ -1349,6 +1355,9 @@ static void resolve_sampler(int s, VStage *v, int i) {
             if (attached && have_targets_live()) { if (!vt->feedback) { vt->feedback = 1; R.feedback++; pass_end(); } vt_layout(vt, VK_IMAGE_LAYOUT_GENERAL); }
             else vt_layout(vt, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             g_dtex[g_ndtex].view = vt_view(vt, &e, dim, 0); g_dtex[g_ndtex].layout = vt->layout;
+            if (passshot_frame() && R.prog[s] && R.prog[s]->serial == 98)
+                printf("nvn_vk_bind: descriptor binding %u image view %p sampler %p layout %d\n",
+                       v->smp[i].binding, (void *)g_dtex[g_ndtex].view, (void *)g_dtex[g_ndtex].smp, (int)g_dtex[g_ndtex].layout);
         } else { static int n; R.dummy_kind++;
             if (n < 3) printf("nvn_vk: (detail of the next line) frame %lld, program #%d, texture format 0x%x, %d x %d x %d, %d levels, draws so far with a dummy for a view-kind mismatch: %lld\n", (long long)nvn_front_frame_next(), R.prog[s] ? R.prog[s]->serial : -1, t->b.format, t->b.width, t->b.height, t->b.depth, nvn_front_tex_levels(t), (long long)R.dummy_kind);
             if (n++ < 20) printf("nvn_vk: texture unit %u of the %s stage: the shader declares view kind %d, the texture is kind %d (target %d, %d samples): a dummy is bound\n", u, s ? "fragment" : "vertex", dim, have, e.target, vt->samples); }
@@ -3248,9 +3257,14 @@ static void vk_present2(void *arg, int progress) {
     LONG64 t_present = tk();
     Tex *t = j->win && j->index >= 0 && j->index < j->win->count ? j->win->tex[j->index] : NULL;
     VTex *vt = t && !t->dead ? t->vk : NULL;
-    if (D.debug && !window_format_logged && t && vt) {
-        printf("nvn_vk: window texture %p NVN format 0x%x, Vulkan format %d, %dx%d, %d bytes per pixel%s\n",
-               (void *)t, t->b.format, (int)vt->fmt, vt->w, vt->h, vt->bpb, vt->rs ? " (scaled)" : "");
+    if (D.debug && !window_format_logged && j->win && t && vt) {
+        printf("nvn_vk: present window index %d/%d; textures:", j->index, j->win->count);
+        for (int i = 0; i < j->win->count && i < 8; i++) {
+            Tex *wt = j->win->tex[i]; VTex *wv = wt && !wt->dead ? wt->vk : NULL;
+            printf(" [%d]=%p NVN 0x%x Vulkan %d %dx%d", i, (void *)wt, wt ? wt->b.format : 0,
+                   wv ? (int)wv->fmt : 0, wv ? wv->w : 0, wv ? wv->h : 0);
+        }
+        printf("\n");
         window_format_logged = 1;
     }
     LONG64 frame = nvn_front_frame_next();
