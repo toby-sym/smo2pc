@@ -3,16 +3,16 @@
 
     python scripts/setup.py --dump <folder> [--jobs N]
 
-The game is Super Mario Odyssey 1.4.1. <folder> is your decrypted dump of it (docs/building.md: what to dump with
-nxdumptool and how to lay it out): the program's ExeFS with the update, the base game's main, the RomFS with the update
-applied and the update's control.nacp; the Help pages and the console's shared fonts are optional. No keys and no
-firmware are read: the files are already decrypted by your console. Where the files go: tools/target.py.
+The game is Super Mario Odyssey 1.4.1. Give either --dump with a decrypted folder (docs/building.md), or --base and
+--update with your own .nsp/.xci files and local Switch keys. The encrypted-container path uses upstream hactool and
+Ryujinx LibHac to prepare the same decrypted folder locally before continuing. Where build files go: tools/target.py.
 
 Nothing of the game is stored in the repository: every step derives its files from the dump into <repo>/build (ignored
 by git). Steps run in this order and are resumable: a step whose output exists is skipped (--redo <step> repeats it,
 --from <step> repeats it and everything after it); compile, tables and link always run, and only rebuild what changed.
 
-    deps       check Python packages, clang, the Vulkan SDK, SDL3 and the WebView2 SDK
+    deps       check Python packages, native SDKs, and (for NSP/XCI) the .NET SDK
+    decrypt    optional NSP/XCI pair -> build/import/dump using local hactool, LibHac, and keys
     import     your dump -> build/dump (modules as ELF, versions); RomFS and Help read in place  (tools/extract/extract.py)
     functions  every function of each module, with exact boundaries                            (tools/extract/functions.py)
     lift       AArch64 -> C for every function -> build/lift/main                              (tools/lifter/recomp.py)
@@ -31,6 +31,7 @@ import glob
 import importlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -59,7 +60,7 @@ def check_deps(a):
             print('  missing Python package %s (pip install %s)' % (mod, pip))
             ok = False
     clang = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
-    vkh = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
+    vkh = T.vulkan_headers()
     sdl = os.environ.get('SDL3_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'SDL3-*')))), '')
     wv2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
     wv2 = os.path.join(wv2, 'build', 'native', 'include', 'WebView2.h') if wv2 else ''
@@ -68,9 +69,61 @@ def check_deps(a):
         found = bool(path) and os.path.exists(path)
         print('  %-38s %s' % (what, path if found else 'NOT FOUND'))
         ok &= found
+    vswhere = os.path.join(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'),
+                           'Microsoft Visual Studio', 'Installer', 'vswhere.exe')
+    vs_install = ''
+    if os.path.isfile(vswhere):
+        result = subprocess.run([vswhere, '-latest', '-products', '*', '-requires',
+                                 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+                                 '-property', 'installationPath'], capture_output=True, text=True)
+        if result.returncode == 0:
+            vs_install = result.stdout.strip()
+    link = ''
+    if vs_install:
+        versions = sorted(glob.glob(os.path.join(vs_install, 'VC', 'Tools', 'MSVC', '*')), reverse=True)
+        for version in versions:
+            candidate = os.path.join(version, 'bin', 'Hostx64', 'x64', 'link.exe')
+            if os.path.isfile(candidate):
+                link = candidate
+                break
+    link = link or shutil.which('link.exe') or ''
+    print('  %-38s %s' % ('Visual Studio C++ linker (link.exe)', link or 'NOT FOUND'))
+    ok &= bool(link)
+
+    sdk_root = os.environ.get('WindowsSdkDir') or os.path.join(
+        os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'), 'Windows Kits', '10')
+    sdk_versions = sorted(glob.glob(os.path.join(sdk_root, 'Include', '*')), reverse=True)
+    sdk = ''
+    for include in sdk_versions:
+        version = os.path.basename(include)
+        required = (os.path.join(include, 'um', 'Windows.h'),
+                    os.path.join(sdk_root, 'Lib', version, 'um', 'x64', 'user32.lib'),
+                    os.path.join(sdk_root, 'Lib', version, 'ucrt', 'x64', 'ucrt.lib'))
+        if all(os.path.isfile(path) for path in required):
+            sdk = include
+            break
+    print('  %-38s %s' % ('Windows SDK headers and x64 libraries', sdk or 'NOT FOUND'))
+    ok &= bool(sdk)
     if a.dump and not os.path.isdir(a.dump):
         print('  dump folder %s does not exist' % a.dump)
         ok = False
+    for label, path in (('base game', a.base), ('game update', a.update)):
+        if path and not os.path.isfile(path):
+            print('  %s package %s does not exist' % (label, path))
+            ok = False
+    if a.base:
+        dotnet = shutil.which('dotnet')
+        sdk_versions = []
+        if dotnet:
+            result = subprocess.run([dotnet, '--list-sdks'], capture_output=True, text=True)
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    match = re.match(r'\s*(\d+)\.', line)
+                    if match:
+                        sdk_versions.append(int(match.group(1)))
+        found = bool(sdk_versions and max(sdk_versions) >= 8)
+        print('  %-38s %s' % ('.NET SDK 8 or later (NSP/XCI import)', dotnet if found else 'NOT FOUND'))
+        ok &= found
     return ok
 
 
@@ -114,6 +167,7 @@ def sdk_lift_complete():
 # name, what it makes (for --status; in the build folder), done test (None: always runs), commands
 STEPS = [
     ('deps', 'tools found', None, None),
+    ('decrypt', 'import/dump', None, None),
     ('import', 'dump, romfs', lambda: os.path.exists(T.elf('main')) and exists('romfs'),
      lambda a: [[PY, tool('extract', 'extract.py')] + need_dump(a)]),
     ('functions', 'functions', lambda: exists('functions', 'main_functions.tsv'),
@@ -135,6 +189,11 @@ NAMES = [s[0] for s in STEPS]
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dump', help='folder of your decrypted dump (docs/building.md)')
+    ap.add_argument('--base', help='your base game .nsp or .xci (use with --update)')
+    ap.add_argument('--update', help='your 1.4.1 update .nsp or .xci (use with --base)')
+    ap.add_argument('--keys', help='local prod.keys file (defaults to the standard Switch key directory)')
+    ap.add_argument('--title-keys', help='local title.keys file for rights-ID encrypted NCAs, if needed')
+    ap.add_argument('--hactool', help='hactool executable (defaults to the pinned upstream Windows release)')
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument('--status', action='store_true')
     ap.add_argument('--steps', action='store_true')
@@ -150,23 +209,52 @@ def main():
     if a.status:
         print('Super Mario Odyssey %s: %s' % (T.VERSION, os.path.relpath(BUILD, REPO)))
         for name, made, done, _ in STEPS:
-            state = 'runs every time (incremental)' if done is None else ('done' if done() else 'to do')
+            state = 'uses --base/--update' if name == 'decrypt' else ('runs every time (incremental)' if done is None else ('done' if done() else 'to do'))
             print('  %-10s %-28s %s' % (name, made, state if name not in ('deps', 'check') else 'on demand'))
         return
+
+    if (a.base or a.update) and (not a.base or not a.update):
+        raise SystemExit('give both --base and --update for the 1.4.1 build')
+    if a.dump and (a.base or a.update):
+        raise SystemExit('use either --dump or the --base/--update package pair')
 
     if a.only:
         todo = [a.only]
     else:
         todo = [n for n in NAMES if n != 'check' or a.check]
+    if a.base and 'import' in todo and 'decrypt' not in todo:
+        todo.insert(todo.index('import'), 'decrypt')
+    if a.only == 'decrypt' and not a.base:
+        raise SystemExit('--only decrypt needs both --base and --update')
     first = NAMES.index(a.from_step) if a.from_step else None
     for name, made, done, cmds in STEPS:
         if name not in todo:
             continue
-        forced = a.only == name or a.redo == name or (first is not None and NAMES.index(name) >= first)
+        forced = (a.only == name or a.redo == name or
+                  (first is not None and NAMES.index(name) >= first) or
+                  (name == 'import' and bool(a.base)))
         if name == 'deps':
             print('[deps]')
             if not check_deps(a):
                 raise SystemExit('some tools are missing (see docs/building.md)')
+            continue
+        if name == 'decrypt':
+            if not a.base:
+                print('[decrypt] skipped (using --dump)')
+                continue
+            cmd = [PY, tool('extract', 'containers.py'), '--base', a.base, '--update', a.update,
+                   '--build', BUILD]
+            if a.keys:
+                cmd.extend(('--keys', a.keys))
+            if a.title_keys:
+                cmd.extend(('--title-keys', a.title_keys))
+            if a.hactool:
+                cmd.extend(('--hactool', a.hactool))
+            print('[decrypt] extracting local NSP/XCI inputs into build/import/dump', flush=True)
+            result = subprocess.run(cmd, cwd=REPO)
+            if result.returncode != 0:
+                raise SystemExit('[decrypt] failed (exit code %d)' % result.returncode)
+            a.dump = T.build('import', 'dump')
             continue
         if done is not None and done() and not forced:
             print('[%s] done (%s)' % (name, made))

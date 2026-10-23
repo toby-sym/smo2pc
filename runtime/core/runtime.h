@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <intrin.h>
 
 typedef union {
     uint8_t b[16];
@@ -20,7 +21,8 @@ typedef struct {
     V128 v[32];
     uint32_t N, Z, C, V;
     uint64_t tpidr;
-    uint64_t ex_addr, ex_val;    /* exclusive monitor: address and value seen by the last LDXR */
+    uint64_t ex_addr, ex_val, ex_val2; /* exclusive monitor: address and values seen by the last LDXR/LDXP */
+    uint32_t ex_size;            /* reserved byte count; distinguishes scalar and pair exclusives */
     uint64_t ex_fail;            /* consecutive failed STXR, for diagnostics */
     uint64_t fn;                 /* entry address of the lifted function entered most recently */
     const char *in_import;       /* name of the host import currently executing on this context, or NULL */
@@ -49,14 +51,53 @@ DEF_MEM(8) DEF_MEM(16) DEF_MEM(32) DEF_MEM(64)
 void stx_diag(Ctx *c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, int bits);
 #define DEF_STX(bits) \
     static inline uint32_t stx##bits(Ctx *c, uint64_t a, uint##bits##_t v) { \
-        if (c->ex_addr != a) { stx_diag(c, a, 0, 0, v, -bits); return 1; } \
+        if (c->ex_addr != a || c->ex_size != bits / 8) { c->ex_addr = ~0ull; c->ex_size = 0; stx_diag(c, a, 0, 0, v, -bits); return 1; } \
         c->ex_addr = ~0ull; \
+        c->ex_size = 0; \
         if (__sync_bool_compare_and_swap((uint##bits##_t *)(uintptr_t)a, (uint##bits##_t)c->ex_val, v)) { c->ex_fail = 0; return 0; } \
         uint##bits##_t seen; memcpy(&seen, (void *)(uintptr_t)a, sizeof seen); \
         stx_diag(c, a, c->ex_val, seen, v, bits); \
         return 1; \
     }
 DEF_STX(8) DEF_STX(16) DEF_STX(32) DEF_STX(64)
+
+/* Pair exclusives use a single atomic snapshot and compare/exchange, matching the guest access width. The
+   128-bit variant relies on CMPXCHG16B, which is part of the Windows 10 x64 minimum CPU requirements. */
+static inline void ldxp32(Ctx *c, uint64_t a, uint32_t *lo, uint32_t *hi) {
+    uint64_t v = __atomic_load_n((uint64_t *)(uintptr_t)a, __ATOMIC_SEQ_CST);
+    c->ex_addr = a; c->ex_size = 8; c->ex_val = (uint32_t)v; c->ex_val2 = (uint32_t)(v >> 32);
+    *lo = (uint32_t)v; *hi = (uint32_t)(v >> 32);
+}
+static inline void ldxp64(Ctx *c, uint64_t a, uint64_t *lo, uint64_t *hi) {
+    __int64 v[2] = {0, 0};
+    _InterlockedCompareExchange128((volatile __int64 *)(uintptr_t)a, 0, 0, v);
+    c->ex_addr = a; c->ex_size = 16; c->ex_val = (uint64_t)v[0]; c->ex_val2 = (uint64_t)v[1];
+    *lo = c->ex_val; *hi = c->ex_val2;
+}
+static inline uint32_t stxp32(Ctx *c, uint64_t a, uint32_t lo, uint32_t hi) {
+    uint64_t expected = (uint32_t)c->ex_val | ((uint64_t)(uint32_t)c->ex_val2 << 32);
+    uint64_t value = (uint64_t)lo | ((uint64_t)hi << 32);
+    if (c->ex_addr != a || c->ex_size != 8) {
+        c->ex_addr = ~0ull; c->ex_size = 0; stx_diag(c, a, 0, 0, value, -64); return 1;
+    }
+    c->ex_addr = ~0ull; c->ex_size = 0;
+    if (__sync_bool_compare_and_swap((uint64_t *)(uintptr_t)a, expected, value)) { c->ex_fail = 0; return 0; }
+    uint64_t seen = __sync_val_compare_and_swap((uint64_t *)(uintptr_t)a, expected, expected);
+    stx_diag(c, a, expected, seen, value, 64);
+    return 1;
+}
+static inline uint32_t stxp64(Ctx *c, uint64_t a, uint64_t lo, uint64_t hi) {
+    __int64 expected[2] = {(__int64)c->ex_val, (__int64)c->ex_val2};
+    if (c->ex_addr != a || c->ex_size != 16) {
+        c->ex_addr = ~0ull; c->ex_size = 0; stx_diag(c, a, 0, 0, lo, -128); return 1;
+    }
+    c->ex_addr = ~0ull; c->ex_size = 0;
+    if (_InterlockedCompareExchange128((volatile __int64 *)(uintptr_t)a, (__int64)hi, (__int64)lo, expected)) {
+        c->ex_fail = 0; return 0;
+    }
+    stx_diag(c, a, c->ex_val, (uint64_t)expected[0], lo, 128);
+    return 1;
+}
 
 static inline V128 rdv(uint64_t a, int n) { V128 v; v.d[0] = 0; v.d[1] = 0; memcpy(&v, (void *)(uintptr_t)a, (size_t)n); return v; }
 static inline void wrv(uint64_t a, const V128 *v, int n) { memcpy((void *)(uintptr_t)a, v, (size_t)n); }

@@ -327,6 +327,8 @@ class Fn:
                 return '', '%s + (uint64_t)%dLL' % (base, imm), ''
             if mode == 1:
                 return '', base, '%s += (uint64_t)%dLL;' % (base, imm)
+            if mode == 2:                               # LDTR / STTR: unprivileged access, same user mapping here
+                return '', '%s + (uint64_t)%dLL' % (base, imm), ''
             if mode == 3:
                 return '%s += (uint64_t)%dLL;' % (base, imm), base, ''
             raise Unimpl('ldst-unpriv')
@@ -345,6 +347,10 @@ class Fn:
             opc, mode, load = bits(w, 31, 30), bits(w, 24, 23), bits(w, 22, 22)
             rt2 = bits(w, 14, 10)
             if v:
+                # SIMD&FP pair encodings reserve opc == 3. Reject it before
+                # deriving a 32-byte width for the 128-bit register helpers.
+                if opc == 3:
+                    raise Unimpl('pair')
                 size = 4 << opc
             else:
                 if opc == 3 or (opc == 1 and not load):
@@ -400,22 +406,37 @@ class Fn:
             opc = bits(w, 31, 30)
             a = '0x%xULL' % (pc + sext(bits(w, 23, 5), 19) * 4)
             if v:
+                # SIMD&FP literal loads reserve opc == 3; size 32 would read
+                # beyond the 128-bit vector register.
+                if opc == 3:
+                    raise Unimpl('ldst-v')
                 return 'c->v[%d] = rdv(%s, %d);' % (rt, a, 4 << opc)
             if opc == 3:
                 return ';'
             return SET(rt, 1, ['rd32(%s)', 'rd64(%s)', '(int64_t)(int32_t)rd32(%s)'][opc] % a)
         if bits(w, 29, 24) == 8 and not v:               # exclusive / ordered
             size, o2, load, o1 = bits(w, 31, 30), bits(w, 23, 23), bits(w, 22, 22), bits(w, 21, 21)
-            if o1:
-                raise Unimpl('excl-pair')
-            nb = 8 << size
             rs = bits(w, 20, 16)
+            if o1:
+                if o2 or size < 2:
+                    raise Unimpl('excl-pair')
+                rt2 = bits(w, 14, 10)
+                if load:
+                    if size == 2:
+                        body = 'uint32_t t1, t2; ldxp32(c, a, &t1, &t2); %s %s' % (SET(rt, 0, 't1'), SET(rt2, 0, 't2'))
+                    else:
+                        body = 'uint64_t t1, t2; ldxp64(c, a, &t1, &t2); %s %s' % (SET(rt, 1, 't1'), SET(rt2, 1, 't2'))
+                    return '{ uint64_t a = %s; %s }' % (XS(rn), body)
+                if size == 2:
+                    return SET(rs, 0, 'stxp32(c, %s, %s, %s)' % (XS(rn), W(rt), W(rt2)))
+                return SET(rs, 0, 'stxp64(c, %s, %s, %s)' % (XS(rn), X(rt), X(rt2)))
+            nb = 8 << size
             if o2:                                       # ldar / stlr: ordered, not exclusive
                 if load:
                     return SET(rt, 1, 'rd%d(%s)' % (nb, XS(rn)))
                 return 'wr%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
             if load:                                     # ldxr / ldaxr: remember address and value
-                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_val = rd%d(a); %s }' % (XS(rn), nb, SET(rt, 1, 'c->ex_val'))
+                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_size = %d; c->ex_val = rd%d(a); %s }' % (XS(rn), nb // 8, nb, SET(rt, 1, 'c->ex_val'))
             # stxr / stlxr: succeeds only if the value is still the one loaded (compare-and-swap)
             return SET(rs, 0, 'stx%d(c, %s, %s)' % (nb, XS(rn), R(rt, size == 3)))
         if bits(w, 31, 31) == 0 and bits(w, 29, 24) in (0x0c, 0x0d):   # AdvSIMD structure load/store
@@ -774,16 +795,28 @@ class Fn:
                     return 'v_f3v(%s, %s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), op, sz, fcount())
                 if opc == 3 and u and size:
                     return 'v_bitsel(%s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), size, q)
+                if opc in (0x0e, 0x0f):              # SABD/UABD, SABA/UABA
+                    if size == 3:
+                        raise Unimpl('simd-i3')
+                    return 'v_absdiff(%s, %s, %s, %d, %d, %d, %d);' % (
+                        V(rd), V(rn), V(rm), size, u, opc == 0x0f, icount(size))
                 op = {(0, 0x10): 'I_ADD', (1, 0x10): 'I_SUB', (0, 0x13): 'I_MUL', (1, 0x11): 'I_CMEQ', (0, 0x11): 'I_CMTST',
                       (0, 0x06): 'I_CMGT', (1, 0x06): 'I_CMHI', (0, 0x07): 'I_CMGE', (1, 0x07): 'I_CMHS',
+                      (0, 0x0c): 'I_SMAX', (0, 0x0d): 'I_SMIN', (1, 0x0c): 'I_UMAX', (1, 0x0d): 'I_UMIN',
+                      (0, 0x14): 'I_SMAXP', (0, 0x15): 'I_SMINP', (1, 0x14): 'I_UMAXP', (1, 0x15): 'I_UMINP',
                       # SMO additions (audio DSP in the SDK): saturating add / subtract, multiply-accumulate (7.3.2)
                       (0, 0x01): 'I_SQADD', (1, 0x01): 'I_UQADD', (0, 0x05): 'I_SQSUB', (1, 0x05): 'I_UQSUB',
-                      (0, 0x12): 'I_MLA'}.get((u, opc))
-                if op is None or (op == 'I_MLA' and size == 3):
+                      (0, 0x12): 'I_MLA', (1, 0x12): 'I_MLS', (0, 0x17): 'I_ADDP'}.get((u, opc))
+                if op is None or (op in ('I_MLA', 'I_MLS') and size == 3) or (op == 'I_ADDP' and size == 3 and not q) or \
+                        (op in ('I_SMAX', 'I_SMIN', 'I_UMAX', 'I_UMIN', 'I_SMAXP', 'I_SMINP', 'I_UMAXP', 'I_UMINP') and size == 3):
                     raise Unimpl('simd-i3')
                 return 'v_i3v(%s, %s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), op, size, icount(size))
             if bits(w, 20, 17) == 0 and bits(w, 11, 10) == 2:    # two registers, miscellaneous
                 opc = bits(w, 16, 12)
+                if not scalar and opc in (0x02, 0x06):   # SADDLP/UADDLP, SADALP/UADALP
+                    if size == 3:
+                        raise Unimpl('simd-across')
+                    return 'v_addlp(%s, %s, %d, %d, %d, %d);' % (V(rd), V(rn), size, u, opc == 0x06, icount(size))
                 op = {(0, 1, 0x0f): 'F1_ABS', (1, 1, 0x0f): 'F1_NEG', (1, 1, 0x1f): 'F1_SQRT', (1, 1, 0x1d): 'F1_RSQRTE',
                       (0, 1, 0x1d): 'F1_RECPE', (0, 0, 0x1d): 'F1_SCVTF', (1, 0, 0x1d): 'F1_UCVTF', (0, 1, 0x1b): 'F1_CVTZS',
                       (1, 1, 0x1b): 'F1_CVTZU', (0, 1, 0x0d): 'F1_CMEQ0', (0, 1, 0x0c): 'F1_CMGT0', (1, 1, 0x0c): 'F1_CMGE0',
@@ -797,10 +830,22 @@ class Fn:
                 if op is None or (op in ('I1_NOT', 'I1_CNT') and size):
                     raise Unimpl('simd-misc')
                 return 'v_i1v(%s, %s, %s, %d, %d);' % (V(rd), V(rn), op, size, icount(size))
+            if scalar and not u and bits(w, 20, 17) == 8 and bits(w, 16, 12) == 0x0d and bits(w, 11, 10) == 2:  # ADDP Dd, Vn.2D
+                # [doc] Arm Instruction Set Reference Guide D5.4: add the two source lanes into scalar Dd.
+                return '{ uint64_t t = c->v[%d].d[0] + c->v[%d].d[1]; vzero(&c->v[%d]); c->v[%d].d[0] = t; }' % (rn, rn, rd, rd)
             if scalar and u and bits(w, 20, 17) == 8 and bits(w, 16, 12) == 0x0d and bits(w, 11, 10) == 2:
                 f, ft = ('df', 'double') if sz else ('f', 'float')   # faddp scalar
                 return '{ %s t = c->v[%d].%s[0] + c->v[%d].%s[1]; vzero(%s); c->v[%d].%s[0] = t; }' % (ft, rn, f, rn, f, V(rd), rd, f)
-            if bits(w, 11, 10) == 0 and not scalar and size < 3:    # SMO addition: three registers, different types
+            if bits(w, 11, 10) == 0 and not scalar and size < 3:    # three registers, different element widths
+                wide_op = {0x0: (0, 0), 0x1: (0, 1), 0x2: (1, 0), 0x3: (1, 1)}.get(bits(w, 15, 12))
+                if wide_op is not None:
+                    sub, wide = wide_op
+                    return 'v_wide_add(%s, %s, %s, %d, %d, %d, %d, %d);' % (
+                        V(rd), V(rn), V(rm), size, q, u, sub, wide)
+                abs_acc = {0x5: 1, 0x7: 0}.get(bits(w, 15, 12))  # SABAL/UABAL, SABDL/UABDL (and the "2" forms)
+                if abs_acc is not None:
+                    return 'v_wide_absdiff(%s, %s, %s, %d, %d, %d, %d);' % (
+                        V(rd), V(rn), V(rm), size, q, u, abs_acc)
                 acc = {0xc: 0, 0x8: 1, 0xa: 2}.get(bits(w, 15, 12))  # SMULL/UMULL, SMLAL/UMLAL, SMLSL/UMLSL (and the "2" forms)
                 if acc is not None:
                     return 'v_mull(%s, %s, %s, %d, %d, %d, %d, -1);' % (V(rd), V(rn), V(rm), size, q, u, acc)
@@ -809,6 +854,10 @@ class Fn:
                 if size == 3 or (size == 2 and not q):
                     raise Unimpl('simd-across')
                 return 'v_addv(%s, %s, %d, %d);' % (V(rd), V(rn), size, icount(size))
+            if not scalar and bits(w, 20, 17) == 8 and bits(w, 16, 12) == 0x07 and bits(w, 11, 10) == 2:
+                if size == 3 or (size == 2 and not q):
+                    raise Unimpl('simd-across')
+                return 'v_addlv(%s, %s, %d, %d, %d);' % (V(rd), V(rn), size, u, icount(size))
             raise Unimpl('simd-e')
         if bits(w, 27, 24) == 0xe:
             if bits(w, 15, 15) == 0 and bits(w, 10, 10) == 1:    # copy: dup / ins / umov / smov

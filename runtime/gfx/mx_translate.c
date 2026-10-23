@@ -39,7 +39,7 @@ typedef struct {
     uint32_t gubos;                           /* compute: uniform buffers reached through global memory */
     unsigned smem_words;
     int uses_smem;
-    int uses_fcs, uses_tf, uses_shfl;                    /* MxIn.screen_scale: gl_FragCoord.xy was scaled / a texelFetch was mapped */
+    int uses_fcs, uses_tf, uses_shfl, uses_sgbasic, uses_sgvote, uses_sgballot; /* subgroup features used by Vulkan output */
     uint32_t images, images_read, images_written;
     uint16_t image_fmt[8]; uint8_t image_type[8];
     uint32_t *jt;                             /* static jump target of SYNC / BRK / CONT */
@@ -783,7 +783,10 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned sr = MXB(i, 20, 8);
         const char *v;
         switch (sr) {
-        case 0x00: v = "gl_SubGroupInvocationARB"; break;
+        case 0x00:
+            if (e->in->target == 1) { v = "gl_SubgroupInvocationID"; e->uses_sgbasic = 1; }
+            else v = "gl_SubGroupInvocationARB";
+            break;
         case 0x11: v = e->in->stage == MX_GEOMETRY || e->in->stage == MX_TESS_CONTROL ? "uint(gl_InvocationID)" : "0u"; break;
         case 0x12: v = "0x3f800000u"; break;                     /* y direction: +1 (the window origin is applied by glClipControl) */
         case 0x13: v = e->in->stage == MX_FRAGMENT ? "(gl_HelperInvocation ? 0xffffffffu : 0u)" : "0u"; break;
@@ -800,11 +803,15 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         case 0x25: v = "MX_GID_X"; break;
         case 0x26: v = "gl_WorkGroupID.y"; break;
         case 0x27: v = "gl_WorkGroupID.z"; break;
-        case 0x38: v = "uint(gl_SubGroupEqMaskARB)"; break;
-        case 0x39: v = "uint(gl_SubGroupLtMaskARB)"; break;
-        case 0x3a: v = "uint(gl_SubGroupLeMaskARB)"; break;
-        case 0x3b: v = "uint(gl_SubGroupGtMaskARB)"; break;
-        case 0x3c: v = "uint(gl_SubGroupGeMaskARB)"; break;
+        case 0x38: case 0x39: case 0x3a: case 0x3b: case 0x3c:
+            if (e->in->target == 1) {
+                static const char *const mask[] = {"gl_SubgroupEqMask.x", "gl_SubgroupLtMask.x", "gl_SubgroupLeMask.x", "gl_SubgroupGtMask.x", "gl_SubgroupGeMask.x"};
+                v = mask[sr - 0x38]; e->uses_sgballot = 1;
+            } else {
+                static const char *const mask[] = {"uint(gl_SubGroupEqMaskARB)", "uint(gl_SubGroupLtMaskARB)", "uint(gl_SubGroupLeMaskARB)", "uint(gl_SubGroupGtMaskARB)", "uint(gl_SubGroupGeMaskARB)"};
+                v = mask[sr - 0x38];
+            }
+            break;
         case 0x50: case 0x52: v = "0u"; break;                   /* clocks */
         default: v = NULL; break;
         }
@@ -814,10 +821,16 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         break;
     }
     case MXOP_VOTE: {
-        const char *p = PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1)), *f = MXB(i, 48, 2) == 0 ? "allInvocationsARB" : MXB(i, 48, 2) == 1 ? "anyInvocationARB" : "allInvocationsEqualARB";
+        const char *p = PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1));
+        const char *f = e->in->target == 1
+            ? (MXB(i, 48, 2) == 0 ? "subgroupAll" : MXB(i, 48, 2) == 1 ? "subgroupAny" : "subgroupAllEqual")
+            : (MXB(i, 48, 2) == 0 ? "allInvocationsARB" : MXB(i, 48, 2) == 1 ? "anyInvocationARB" : "allInvocationsEqualARB");
         emit(e, "bool vp = %s;", p);
-        if (PD(e, MXB(i, 45, 3))) emit(e, " %s = %s(vp);", PD(e, MXB(i, 45, 3)), f);
-        if (MXB(i, 0, 8) != 255) emit(e, " %s = uint(ballotARB(vp));", DST);
+        if (PD(e, MXB(i, 45, 3))) { if (e->in->target == 1) e->uses_sgvote = 1; emit(e, " %s = %s(vp);", PD(e, MXB(i, 45, 3)), f); }
+        if (MXB(i, 0, 8) != 255) {
+            if (e->in->target == 1) { e->uses_sgballot = 1; emit(e, " %s = subgroupBallot(vp).x;", DST); }
+            else emit(e, " %s = uint(ballotARB(vp));", DST);
+        }
         break;
     }
     case MXOP_NOP: case MXOP_DEPBAR: case MXOP_MEMBAR: case MXOP_VOTE_vtg: case MXOP_CCTL: case MXOP_CCTLL: case MXOP_SSY: case MXOP_PBK: case MXOP_PCNT:
@@ -1120,10 +1133,14 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned ms = MXB(i, 37, 2);
         if (MXB(i, 47, 1) || MXB(i, 48, 2) || ms == 1) { fail(e, "SHF", "SHF with CC/X or undefined max shift"); break; }
         b = (op == MXOP_SHF_l_reg || op == MXOP_SHF_r_reg) ? R20 : I20(e, i);
-        emit(e, "uint sh = %s; sh = %s; uint64_t v = packUint2x32(uvec2(%s, %s));", b, MXB(i, 50, 1) ? (ms == 0 ? "sh & 31u" : "sh & 63u") : (ms == 0 ? "min(sh, 32u)" : "min(sh, 63u)"), A8, R39);
-        if (!right) emit(e, " v = sh >= 64u ? 0ul : v << sh; %s = unpackUint2x32(v).y;", DST);
-        else if (ms == 3) emit(e, " v = uint64_t(int64_t(v) >> sh); %s = unpackUint2x32(v).x;", DST);
-        else emit(e, " v = sh >= 64u ? 0ul : v >> sh; %s = unpackUint2x32(v).x;", DST);
+        /* Keep the 64-bit funnel shift in two uints so it works on Vulkan devices without shaderInt64. */
+        emit(e, "{ uint sh = %s; sh = %s; uint lo = %s, hi = %s;", b, MXB(i, 50, 1) ? (ms == 0 ? "sh & 31u" : "sh & 63u") : (ms == 0 ? "min(sh, 32u)" : "min(sh, 63u)"), A8, R39);
+        if (!right)
+            emit(e, " if (sh == 0u) %s = hi; else if (sh < 32u) %s = (hi << sh) | (lo >> (32u - sh)); else %s = lo << (sh - 32u); }", DST, DST, DST);
+        else if (ms == 3)
+            emit(e, " if (sh == 0u) %s = lo; else if (sh < 32u) %s = (lo >> sh) | (hi << (32u - sh)); else %s = uint(int(hi) >> int(sh - 32u)); }", DST, DST, DST);
+        else
+            emit(e, " if (sh == 0u) %s = lo; else if (sh < 32u) %s = (lo >> sh) | (hi << (32u - sh)); else %s = hi >> (sh - 32u); }", DST, DST, DST);
         break;
     }
     case MXOP_BFE_reg: case MXOP_BFE_cbuf: case MXOP_BFE_imm: {
@@ -1350,7 +1367,11 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned scale = cbuf ? MXB(i, 51, 5) : MXB(i, 28, 5), neg = cbuf ? MXB(i, 56, 1) : MXB(i, 37, 1), x = cbuf ? MXB(i, 57, 1) : MXB(i, 38, 1);
         if (x || MXB(i, 47, 1) || MXB(i, 48, 3) != 7) { fail(e, "LEA.HI X/CC/P", "LEA.HI with extend, condition code or predicate output"); break; }
         b = cbuf ? CB(e, i) : R20;
-        emit(e, "uint64_t lo = packUint2x32(uvec2(%s, %s));%s %s = %s + unpackUint2x32(lo >> %uu).x;", A8, R39, neg ? " lo = ~lo + 1ul;" : "", DST, b, 32 - scale);
+        /* LEA.HI adds the high part of a signed 64-bit pair; emulate its negate and shift with uints. */
+        emit(e, "{ uint lo = %s, hi = %s;", A8, R39);
+        if (neg) emit(e, " lo = ~lo + 1u; hi = ~hi + uint(lo == 0u);");
+        if (scale == 0) emit(e, " %s = %s + hi; }", DST, b);
+        else emit(e, " %s = %s + ((lo >> %uu) | (hi << %uu)); }", DST, b, 32 - scale, scale);
         break;
     }
     case MXOP_SULD: case MXOP_SUST: {                       /* image load / store */
@@ -1832,12 +1853,17 @@ int mx_translate(const MxIn *in, MxOut *out) {
         if (in->stage == MX_VERTEX) e->out_attr |= in->force_out;      /* declared and set to (0, 0, 0, 1) below */
         const int vk = in->target == 1;
         const char *set0 = vk ? "set = 0, " : "", *set1 = vk ? "set = 1, " : "";
-        if (vk) emit(&h, "#version 460\n#extension GL_ARB_gpu_shader_int64 : enable\n#extension GL_EXT_texture_shadow_lod : enable\n#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n");
-        else
-        emit(&h, "#version 460 compatibility\n#extension GL_ARB_bindless_texture : require\n#extension GL_NV_gpu_shader5 : enable\n#extension GL_ARB_gpu_shader_int64 : enable\n"
-                 "#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n#extension GL_EXT_texture_shadow_lod : enable\n");
+        if (vk) {
+            emit(&h, "#version 460\n#extension GL_EXT_texture_shadow_lod : enable\n");
+            if (e->uses_sgbasic || e->uses_shfl) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n");
+            if (e->uses_sgvote) emit(&h, "#extension GL_KHR_shader_subgroup_vote : require\n");
+            if (e->uses_sgballot) emit(&h, "#extension GL_KHR_shader_subgroup_ballot : require\n");
+            if (e->uses_shfl) emit(&h, "#extension GL_KHR_shader_subgroup_shuffle : require\n");
+        } else
+            emit(&h, "#version 460 compatibility\n#extension GL_ARB_bindless_texture : require\n#extension GL_NV_gpu_shader5 : enable\n#extension GL_ARB_gpu_shader_int64 : enable\n"
+                     "#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n#extension GL_EXT_texture_shadow_lod : enable\n");
         if (e->uses_layer_out || e->uses_vp_out) emit(&h, "#extension GL_ARB_shader_viewport_layer_array : require\n");
-        if (e->uses_shfl) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_shuffle : require\n");      /* SHFL */
+        if (!vk && e->uses_shfl) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_shuffle : require\n");      /* SHFL */
         emit(&h, "%s", k_prelude);
         if (vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* */
         else

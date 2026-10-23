@@ -4761,7 +4761,9 @@ static void wb_set_textures(Ctx *c) {                   /* (builder, count, text
 /* the textures of every window the game made (for the Vulkan back end's resolution scale: nvn_vk_draw.c wintex_is). */
 static Tex *g_window_tex[16];
 static volatile int g_window_tex_n;
+static volatile LONG g_window_trace_n;
 int nvn_front_tex_is_window(const Tex *t) { for (int i = 0; i < g_window_tex_n; i++) if (g_window_tex[i] == t) return 1; return 0; }
+static int window_trace_on(void) { static int on = -1; if (on < 0) on = getenv("SMO_WINDOW_TRACE") && atoi(getenv("SMO_WINDOW_TRACE")); return on; }
 static void win_initialize(Ctx *c) {                    /* (window, builder) */
     Window *w = hnew(A0, K_WIN, sizeof *w);
     w->count = (int)(rd32(A1) & 0xff) <= 6 ? (int)(rd32(A1) & 0xff) : 0;
@@ -4777,7 +4779,9 @@ static void win_initialize(Ctx *c) {                    /* (window, builder) */
 static void win_acquire(Ctx *c) {                       /* (window, sync, int *textureIndex) -> 0 = success */
     static volatile LONG next;
     Window *w = hobj(A0, K_WIN);
-    if (A2) wr32(A2, (uint32_t)(InterlockedIncrement(&next) % (w && w->count ? (w->nactive ? w->nactive : w->count) : 2)));
+    uint32_t index = (uint32_t)(InterlockedIncrement(&next) % (w && w->count ? (w->nactive ? w->nactive : w->count) : 2));
+    if (A2) wr32(A2, index);
+    if (window_trace_on()) { LONG n = InterlockedIncrement(&g_window_trace_n); if (n <= 24) printf("nvn_window: acquire #%ld index %u texture %p (%d textures) frame %lld\n", n, index, (void *)(w && index < (uint32_t)w->count ? w->tex[index] : NULL), w ? w->count : 0, (long long)nvn_front_frame_next()); }
     InterlockedExchangePointer(&g_window_sync, A1 ? hobj(A1, K_SYNC) : NULL);        /* nvnSyncWait on it = wait for the refresh that frees the texture */
     display_clock_sample(A2);
     RET(0);
@@ -4799,6 +4803,7 @@ static int g_present_out, g_present_sync = -1;
 static void job_present_signal(void *arg) { g_rb->present(arg); SetEvent(g_present_ev); }
 static void queue_present(Ctx *c) {                     /* (queue, window, textureIndex) */
     PresentJob j = {hobj(A1, K_WIN), (int)A2};
+    if (window_trace_on()) { LONG n = InterlockedIncrement(&g_window_trace_n); if (n <= 24) printf("nvn_window: present #%ld index %d texture %p frame %lld\n", n, j.index, j.win && j.index >= 0 && j.index < j.win->count ? (void *)j.win->tex[j.index] : NULL, (long long)nvn_front_frame_next()); }
     if (g_tl_on) nvn_tl(TL_PRESENT_CALL, 0);
     g_pf_main_tid = GetCurrentThreadId();
     display_before_present();

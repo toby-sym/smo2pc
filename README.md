@@ -13,9 +13,9 @@ machine code is translated to C ahead of time and compiled for the PC; the syste
 video, input and file system the game uses are re-implemented by this project's runtime.
 
 > **This repository contains no game code, no game assets, no keys and no firmware.**
-> You need your own copy of the game, dumped from your own console. The build reads the dump's decrypted files: no
-> keys and no firmware are needed. Everything derived from the game is generated on your PC, under `build/`, and never
-> leaves it.
+> You need your own copy of the game, dumped from your own console. You can give the build decrypted files directly, or
+> give it NSP/XCI packages and local key files. Everything derived from the game is generated on your PC, under
+> `build/`, and never leaves it.
 
 ## Status
 
@@ -47,7 +47,9 @@ something was not checked, it says so.
 
 ## How it works
 
-1. **Import.** `scripts/setup.py` reads your decrypted dump in place and converts the program's modules to ELF.
+1. **Import.** `scripts/setup.py` reads a decrypted dump in place or extracts NSP/XCI packages with upstream hactool;
+   Ryujinx LibHac decrypts NCAs and merges the update's BKTR RomFS using your local keys. It then converts the program's
+   modules to ELF.
 2. **Function list.** Every function of the executable, with boundaries from its own unwind tables and symbols (54,214
    in `main`).
 3. **Lifting.** `tools/lifter/recomp.py` turns each AArch64 function into a C function; clang compiles them into a game
@@ -60,10 +62,14 @@ something was not checked, it says so.
 
 ## Requirements
 
-- Windows 10/11 x64 and a Vulkan 1.3 GPU (developed on NVIDIA; `VK_EXT_graphics_pipeline_library`,
-  `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
-- Your own *Super Mario Odyssey* dump: the 1.4.1 program, the base game's executable, the RomFS with the update applied
-  and the update's control data. [`docs/building.md`](docs/building.md) lists what to dump and how to lay it out.
+- Windows 10/11 x64 and a Vulkan 1.3 GPU. The renderer uses vertex input dynamic state and depth clip control for the
+  game's default NVN depth mode. `VK_EXT_graphics_pipeline_library` and `VK_EXT_extended_dynamic_state3` speed up
+  pipeline work when available; the renderer falls back to ordinary pipelines and fixed pipeline state without them.
+  Other missing GPU operations are reported and skipped.
+- Your own *Super Mario Odyssey* dump: either the decrypted folder layout or a base `.nsp`/`.xci` and a 1.4.1 update
+  `.nsp`/`.xci`, plus local `prod.keys` and (when needed) `title.keys`. [`docs/building.md`](docs/building.md) lists
+  the layouts and key locations.
+- [.NET SDK 8 or later](https://dotnet.microsoft.com/download/dotnet/8.0) when importing encrypted NSP/XCI packages.
 - [LLVM/clang 9.0.0](https://releases.llvm.org/), Visual Studio 2019 Build Tools (16.11) with Windows SDK 10.0.19041,
   the [Vulkan SDK](https://vulkan.lunarg.com/) 1.4, [SDL3](https://github.com/libsdl-org/SDL) 3.4.18, the
   [WebView2 SDK](https://www.nuget.org/packages/Microsoft.Web.WebView2), Python 3.13.
@@ -77,23 +83,32 @@ py -3.13 -m venv .venv
 .venv\Scripts\python scripts\run.py play --exe smo_native.exe --seconds 0
 ```
 
+Or give it an encrypted base package and 1.4.1 update package (`.nsp` or `.xci`), plus local Switch keys when they are
+not in the standard key directory:
+
+```bat
+.venv\Scripts\python scripts\setup.py --base "<base.nsp or base.xci>" --update "<update.nsp or update.xci>" --keys "%USERPROFILE%\.switch\prod.keys"
+```
+
+See [`docs/building.md`](docs/building.md) for `title.keys`, hactool setup, and package details.
+
 The first build takes a while (lifting and compiling the game); later runs of `setup.py` only redo what changed.
 [`docs/building.md`](docs/building.md) has the details, settings and troubleshooting.
 
 ## CI and releases
 
-Every branch push and pull request validates the Python tools and publishes a versioned source ZIP as an Actions
-artifact for 14 days. A tag such as `v0.1.0` publishes a GitHub Release with the source ZIP and its SHA-256 checksum.
-Actions never builds the game executable: that requires a local game dump and Windows graphics SDKs, which stay on
-your PC.
+Every branch push and pull request validates the Python tools and the LibHac importer, then publishes a versioned
+source ZIP as an Actions artifact for 14 days. A tag such as `v0.1.0` publishes a GitHub Release with the source ZIP
+and its SHA-256 checksum. Actions does not build the game executable; that needs a local game dump and Windows graphics
+SDKs, which stay on your PC.
 
 ## Repository layout
 
 ```
 runtime/          the host runtime, by subsystem: core, libc, os, fs, gfx, audio, input, services, game
-scripts/          setup.py (from your dump to a build) and run.py (start the game, play an input sequence)
+scripts/          setup.py (from your dump to a build), install_hactool.py and run.py
 tools/target.py   where the build's files go
-tools/extract/    the import of your dump (NSO to ELF, version checks) and the function lists
+tools/extract/    decrypted folder and NSP/XCI importers, NSO to ELF conversion, version checks, and function lists
 tools/lifter/     the AArch64 to C lifter, the SDK lifter, the differential test and the build steps
 tools/dev/        lookups for debugging: disassembly, callers, archives, stage placement, save warps, profiles
 tests/            scripted Cap Kingdom run, stage stress test, every shader stage offline, translator equivalence,

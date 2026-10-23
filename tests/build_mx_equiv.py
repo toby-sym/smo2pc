@@ -3,7 +3,6 @@
     python tests/build_mx_equiv.py
     build\\bin\\mx_equiv.exe <folder of vk_prog_*_1.bin> [max]      (run from build\\bin: it loads smo_glslang.dll)
 """
-import glob
 import os
 import subprocess
 import sys
@@ -12,7 +11,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'tools'))
 import target as T  # noqa: E402
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
-VKH = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
+VKH = T.vulkan_headers()
 VKLIB = os.path.join(os.path.dirname(VKH), 'Lib', 'vulkan-1.lib')
 out = T.build('bin', 'mx_equiv.exe')
 cmd = [CLANG, '-O1', '-w'] + T.runtime_includes() + ['-I', VKH,

@@ -256,6 +256,9 @@ static uint64_t g_fr_condhash = 1469598103934665603ull;
 /* debug aid SMO_VK_PASSSHOT=<frame> or <first>-<last>[/<step>]: the frames whose render passes pass_shot saves and
  * whose draws are logged (a range finds a defect that shows in some frames only; its files carry the frame number). */
 static long long g_ps_lo = -2, g_ps_hi, g_ps_step = 1;
+static LONG64 g_ps_frame_override = -1, g_ps_deferred_frame = -1;
+static int g_cmd_submitting;
+static LONG64 passshot_frame_number(void) { return g_ps_frame_override >= 0 ? g_ps_frame_override : nvn_front_frame_next(); }
 static void passshot_parse(void) {
     const char *e = getenv("SMO_VK_PASSSHOT"), *d;
     g_ps_lo = -1;
@@ -265,10 +268,22 @@ static void passshot_parse(void) {
 }
 static int passshot_frame(void) {
     if (g_ps_lo == -2) passshot_parse();
-    long long f = nvn_front_frame_next();
+    long long f = passshot_frame_number();
     return g_ps_lo >= 0 && f >= g_ps_lo && f <= g_ps_hi && (f - g_ps_lo) % g_ps_step == 0;
 }
 static int passshot_range(void) { if (g_ps_lo == -2) passshot_parse(); return g_ps_hi > g_ps_lo; }
+static void cmd_wait_all(void);
+/* SMO_VK_COPYLOG=<frame>: trace texture blits and the window texture selected for that presentation. */
+static LONG64 g_copylog_frame = -2;
+static LONG64 copylog_frame(void) {
+    if (g_copylog_frame == -2) { const char *e = getenv("SMO_VK_COPYLOG"); g_copylog_frame = e ? atoll(e) : -1; }
+    return g_copylog_frame;
+}
+static uint64_t copylog_hash(const uint8_t *p, size_t n) {
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
 /* NVN counter type 1, SAMPLES_PASSED (occlusion). Between nvnCommandBufferResetCounter and ReportCounter the
  * samples of every draw are counted. A Vulkan occlusion query begun inside a render pass must end in it, so the count is
  * made of segments: one query from the first draw of a pass while counting until the pass (or the counting) ends.
@@ -288,10 +303,26 @@ static uint64_t g_occ_head, g_occ_tail, g_occ_mark, g_occ_seg_serial;   /* next 
 static OccEntry g_occ_q[OCC_Q];
 static int g_occ_qh, g_occ_qn;                     /* oldest entry, entries queued */
 static uint64_t g_occ_total;                       /* samples of the count the resolved entries belong to */
-static int g_occ_sync = -1, g_occ_present = -1;
+static int g_occ_enabled = -1, g_occ_sync = -1, g_occ_present = -1;
 static LONG64 g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_present_waits, g_occ_late;
+static LONG64 g_occ_unavailable;
 static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % OCC_MAX)); g_occ_open = 0; } }
-static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
+static void pass_end_at(int caller_line) {
+    if (!R.in_pass) return;
+    Tex *trace_t = R.ncol ? R.col[0].tex : NULL;
+    if (copylog_frame() == nvn_front_frame_next())
+        printf("nvn_vk_passend: frame %lld caller line %d thread %lu recording %d slot %d serial %llu cmd %p tex %p fmt 0x%x %dx%d submitting %d\n",
+               (long long)nvn_front_frame_next(), caller_line, (unsigned long)GetCurrentThreadId(), R.recording, R.cur,
+               (unsigned long long)R.serial, (void *)R.cmd, (void *)trace_t, trace_t ? (unsigned)trace_t->b.format : 0,
+               trace_t ? trace_t->b.width : 0, trace_t ? trace_t->b.height : 0, g_cmd_submitting);
+    occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0;
+    if (g_cmd_submitting && passshot_frame()) {
+        g_ps_deferred_frame = passshot_frame_number();
+        if (copylog_frame() == g_ps_deferred_frame)
+            printf("nvn_vk_passend: frame %lld passshot deferred until queue submission completes\n", (long long)g_ps_deferred_frame);
+    } else pass_shot();
+}
+#define pass_end() pass_end_at(__LINE__)
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 /* report timestamps, the clock nvn_gl.c's now_ns uses (performance counter in nanoseconds) */
@@ -360,7 +391,9 @@ static void cmd_begin(void) {
 /* Ends the command buffer being recorded and gives it to the queue. Returns its number (the last one when nothing was recorded). */
 static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (!R.recording) { if (!wait && !signal) return R.serial; cmd_begin(); }
+    g_cmd_submitting++;
     pass_end();
+    g_cmd_submitting--;
     Slot *s = &R.slot[R.cur];
     if (g_ts_on > 0) vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_ts_pool, (uint32_t)R.cur * 2 + 1);
     VKC(vkEndCommandBuffer(s->cmd));
@@ -374,6 +407,13 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     s->pending = 1; s->serial = ++R.serial;
     s->rlap1 = R.ring_lap; s->rpos1 = R.ring_pos;
     R.recording = 0; R.cmd = NULL; R.flushes++;
+    if (g_ps_deferred_frame >= 0) {
+        g_ps_frame_override = g_ps_deferred_frame; g_ps_deferred_frame = -1;
+        if (copylog_frame() == g_ps_frame_override)
+            printf("nvn_vk_passend: frame %lld passshot after queue submission\n", (long long)g_ps_frame_override);
+        pass_shot();
+        g_ps_frame_override = -1;
+    }
     return R.serial;
 }
 static void cmd_wait_all(void) { cmd_submit(NULL, NULL); for (int i = 0; i < NSLOT; i++) slot_wait(&R.slot[i]); R.done = R.serial; }
@@ -595,6 +635,14 @@ static void vt_layout(VTex *vt, VkImageLayout to) {
     cmd_begin();
     image_barrier(vt->img, vt->aspect, vt->layout, to);
     vt->layout = to;
+}
+/* Repeated writes in TRANSFER_DST do not change layout, so vt_layout alone cannot order them. */
+static void vt_transfer_dst(VTex *vt) {
+    if (vt->layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        pass_end();
+        cmd_begin();
+        image_barrier(vt->img, vt->aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    } else vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 }
 /* nvnCommandBufferBarrier with ORDER_FRAGMENTS (2) / ORDER_FRAGMENTS_TILED (4): the draws after it read what
  * the draws before it rendered (a texture that is also a render target of the pass, or was one of the pass before
@@ -838,9 +886,9 @@ static void rs_upload(VTex *vt, int level, int layer, uint64_t off, uint32_t row
     c.bufferOffset = off; c.bufferRowLength = rowlen; c.bufferImageHeight = rows;
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
     c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = 1;
-    vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vt_transfer_dst(tmp);
     vkCmdCopyBufferToImage(R.cmd, R.ring, tmp->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-    vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); vt_transfer_dst(vt);
     b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1;
     b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.dstSubresource.mipLevel = (uint32_t)level; b.dstSubresource.baseArrayLayer = (uint32_t)layer; b.dstSubresource.layerCount = 1;
     b.srcOffsets[1].x = w; b.srcOffsets[1].y = h; b.srcOffsets[1].z = 1;
@@ -874,7 +922,7 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
         R.upload_bytes += (LONG64)size;
         return;
     }
-    vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vt_transfer_dst(vt);
     VkBufferImageCopy c;
     memset(&c, 0, sizeof c);
     c.bufferOffset = off;
@@ -1071,10 +1119,16 @@ static VkImageView vt_view(VTex *vt, const EView *e, int dim, int attach) {
     for (VView *n = vt->views; n; n = n->next) if (n->vtype == dim && n->attach == attach && !memcmp(&n->e, e, sizeof *e)) return n->view;
     VView *n = calloc(1, sizeof *n);
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    VkImageViewUsageCreateInfo ui = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     static const VkComponentSwizzle sw[6] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
     int ex, dec;
     n->e = *e; n->vtype = dim; n->attach = attach;
     ci.image = vt->img; ci.format = vt->fmt;
+    if (vt->storage) {
+        ui.usage = attach == 2 ? VK_IMAGE_USAGE_STORAGE_BIT : attach ?
+            (vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) : VK_IMAGE_USAGE_SAMPLED_BIT;
+        ci.pNext = &ui;
+    }
     if (e->format != vt->t->b.format && vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT && !vt->decode && !vt->expand) { VkFormat f = tex_vkfmt(e->format, &ex, &dec); if (f && !ex && !dec && fmt_aspect(f) == VK_IMAGE_ASPECT_COLOR_BIT) ci.format = f; }
     if (attach) {
         ci.viewType = VK_IMAGE_VIEW_TYPE_2D; ci.subresourceRange.aspectMask = vt->aspect;
@@ -1305,6 +1359,8 @@ static void resolve_sampler(int s, VStage *v, int i) {
                    s, u, (unsigned long long)handle, (r & 1) ? "live" : "NO TEXTURE", (void *)((r & 1) ? t : NULL),
                    (r & 1) ? (unsigned)t->b.format : 0u, (r & 1) ? t->b.width : 0, (r & 1) ? t->b.height : 0, (void *)((r & 1) ? t->mem : NULL),
                    (r & 1) ? t->gpu_written : -1, (void *)c0, c0 ? (unsigned)c0->b.format : 0u, (void *)(c0 ? c0->mem : NULL));
+            if (r & 1) printf("nvn_vk_bind:   view set 0x%x format 0x%x swizzle %u%u%u%u | sampler min %u mag %u wrap %u/%u/%u\n",
+                              view.set, view.format, view.swz[0], view.swz[1], view.swz[2], view.swz[3], sp.min, sp.mag, sp.ws, sp.wt, sp.wr);
             if (!(r & 1) && handle) printf("nvn_vk_bind:   why: %s\n", nvn_front_handle_why(R.tpool, handle));
             if ((r & 1) && t->b.target == 2 && t->b.format == 0x3f && t->b.width * t->b.height * t->b.depth <= 4096) {      /* debug aid: a small R11G11B10F volume (colour-grading LUT): its contents */
                 static uint32_t px[4096];
@@ -1334,6 +1390,10 @@ static void resolve_sampler(int s, VStage *v, int i) {
         int attached = R.depth.tex == t, dim = v->smp[i].dim;
         for (int k = 0; k < R.ncol; k++) attached |= R.col[k].tex == t;
         eview_of(t, vt, &view, &e);
+        if (passshot_frame() && R.prog[s] && R.prog[s]->serial == 98)
+            printf("nvn_vk_bind: effective view target %d format 0x%x swizzle %u%u%u%u levels %d+%d layers %d+%d | base swizzle %u%u%u%u, VkFormat %d image %p layout %d\n",
+                   e.target, e.format, e.swz[0], e.swz[1], e.swz[2], e.swz[3], e.lvl0, e.nlvl, e.lay0, e.nlay,
+                   t->b.swz[0], t->b.swz[1], t->b.swz[2], t->b.swz[3], (int)vt->fmt, (void *)vt->img, (int)vt->layout);
         int have = target_dim(e.target);
         int ok = have == dim || (dim == DIM_2D && (have == DIM_2DA || have == DIM_CUBE || have == DIM_CUBEA)) || (dim == DIM_2DA && (have == DIM_2D || have == DIM_CUBE || have == DIM_CUBEA)) ||
                  (dim == DIM_CUBE && have == DIM_CUBEA) || (dim == DIM_CUBEA && have == DIM_CUBE) || (dim == DIM_1D && have == DIM_1DA) || (dim == DIM_1DA && have == DIM_1D) ||
@@ -1348,6 +1408,9 @@ static void resolve_sampler(int s, VStage *v, int i) {
             if (attached && have_targets_live()) { if (!vt->feedback) { vt->feedback = 1; R.feedback++; pass_end(); } vt_layout(vt, VK_IMAGE_LAYOUT_GENERAL); }
             else vt_layout(vt, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             g_dtex[g_ndtex].view = vt_view(vt, &e, dim, 0); g_dtex[g_ndtex].layout = vt->layout;
+            if (passshot_frame() && R.prog[s] && R.prog[s]->serial == 98)
+                printf("nvn_vk_bind: descriptor binding %u image view %p sampler %p layout %d\n",
+                       v->smp[i].binding, (void *)g_dtex[g_ndtex].view, (void *)g_dtex[g_ndtex].smp, (int)g_dtex[g_ndtex].layout);
         } else { static int n; R.dummy_kind++;
             if (n < 3) printf("nvn_vk: (detail of the next line) frame %lld, program #%d, texture format 0x%x, %d x %d x %d, %d levels, draws so far with a dummy for a view-kind mismatch: %lld\n", (long long)nvn_front_frame_next(), R.prog[s] ? R.prog[s]->serial : -1, t->b.format, t->b.width, t->b.height, t->b.depth, nvn_front_tex_levels(t), (long long)R.dummy_kind);
             if (n++ < 20) printf("nvn_vk: texture unit %u of the %s stage: the shader declares view kind %d, the texture is kind %d (target %d, %d samples): a dummy is bound\n", u, s ? "fragment" : "vertex", dim, have, e.target, vt->samples); }
@@ -1386,8 +1449,10 @@ static void set_dynamic_state(void) {
     vkCmdSetStencilCompareMask(R.cmd, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)R.svmask[0]); vkCmdSetStencilCompareMask(R.cmd, VK_STENCIL_FACE_BACK_BIT, (uint32_t)R.svmask[1]);
     vkCmdSetStencilWriteMask(R.cmd, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)R.swmask[0]); vkCmdSetStencilWriteMask(R.cmd, VK_STENCIL_FACE_BACK_BIT, (uint32_t)R.swmask[1]);
     vkCmdSetStencilReference(R.cmd, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)R.sref[0]); vkCmdSetStencilReference(R.cmd, VK_STENCIL_FACE_BACK_BIT, (uint32_t)R.sref[1]);
-    { static int nocull = -1; if (nocull < 0) nocull = getenv("SMO_VK_DIAG_NOCULL") != NULL;      /* diagnosis only */
-      vkCmdSetCullMode(R.cmd, nocull ? 0 : (R.poly[0] & 3)); }
+    { static int nocull = -1, nocull98 = -1;
+      if (nocull < 0) nocull = getenv("SMO_VK_DIAG_NOCULL") != NULL;      /* diagnosis only */
+      if (nocull98 < 0) nocull98 = getenv("SMO_VK_DIAG_NOCULL98") != NULL;
+      vkCmdSetCullMode(R.cmd, nocull || (nocull98 && R.prog[0] && R.prog[0]->serial == 98) ? 0 : (R.poly[0] & 3)); }
     vkCmdSetFrontFace(R.cmd, R.poly[1] ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
     { static int nodepth = -1; if (nodepth < 0) nodepth = getenv("SMO_VK_DIAG_NODEPTH") != NULL;      /* diagnosis only */
       vkCmdSetDepthTestEnable(R.cmd, nodepth ? 0 : (d & 1)); vkCmdSetDepthWriteEnable(R.cmd, (d >> 1) & 1); }
@@ -1517,14 +1582,20 @@ static void cb_sync(void) {                        /* guest memory must hold wha
     cb_land(mid);
 }
 static void occ_pool(void) {
+    if (g_occ_enabled < 0) {
+        const char *e = getenv("SMO_VK_OCC");
+        g_occ_enabled = !e || atoi(e) != 0;
+        g_occ_sync = getenv("SMO_VK_OCC_SYNC") && atoi(getenv("SMO_VK_OCC_SYNC"));
+        g_occ_present = !getenv("SMO_VK_OCC_PRESENT") || atoi(getenv("SMO_VK_OCC_PRESENT"));
+        if (!g_occ_enabled) printf("nvn_vk: SMO_VK_OCC=0: hardware occlusion queries disabled; reports return 0 samples\n");
+    }
+    if (!g_occ_enabled) { g_occ_on = 0; return; }
     if (g_occ_pool) return;
     if (!D.f12.hostQueryReset) nvn_vk_missing("occlusion counters on a GPU without hostQueryReset");
     VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     qi.queryType = VK_QUERY_TYPE_OCCLUSION; qi.queryCount = OCC_MAX;
     VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_occ_pool));
     vkResetQueryPool(V.device, g_occ_pool, 0, OCC_MAX);
-    g_occ_sync = getenv("SMO_VK_OCC_SYNC") && atoi(getenv("SMO_VK_OCC_SYNC"));
-    g_occ_present = !getenv("SMO_VK_OCC_PRESENT") || atoi(getenv("SMO_VK_OCC_PRESENT"));
 }
 /* SMO_VK_GS_DEBUG=1 or 3 (gs_dbg_mode), draws with a geometry stage. (a) The pipeline statistics of 16 of them (every 25th),
  * printed once the GPU has run them (gsq_poll at every present): primitives in, vertex and geometry invocations, primitives
@@ -1610,13 +1681,25 @@ static int occ_done(uint64_t serial, int wait) {
 }
 /* Segments [lo, hi) have run: their samples are added to *sum (none when sum is NULL) and their queries are free again. */
 static void occ_take(uint64_t lo, uint64_t hi, uint64_t *sum) {
-    static uint64_t res[OCC_MAX];
+    static uint64_t res[OCC_MAX * 2];
     while (lo < hi) {
         uint32_t first = (uint32_t)(lo % OCC_MAX);
         uint32_t n = hi - lo < (uint64_t)(OCC_MAX - first) ? (uint32_t)(hi - lo) : OCC_MAX - first;
         if (sum) {
-            VKC(vkGetQueryPoolResults(V.device, g_occ_pool, first, n, (size_t)n * 8, res, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-            for (uint32_t i = 0; i < n; i++) *sum += res[i];
+            /* occ_resolve calls occ_done first. Read without WAIT_BIT: Intel's Vulkan driver can hang in that
+             * path. Availability also lets us identify and tolerate a query the driver leaves unavailable after
+             * the submission fence has signalled. */
+            memset(res, 0, (size_t)n * 16);
+            VkResult r = vkGetQueryPoolResults(V.device, g_occ_pool, first, n, (size_t)n * 16, res, 16,
+                                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            if (r != VK_SUCCESS && r != VK_NOT_READY) vk_fatal("vkGetQueryPoolResults(occlusion queries)", r);
+            for (uint32_t i = 0; i < n; i++) {
+                if (res[i * 2 + 1]) *sum += res[i * 2];
+                else {
+                    if (InterlockedIncrement64(&g_occ_unavailable) <= 16)
+                        printf("nvn_vk: occlusion query %u unavailable after its submission fence signalled; using 0 samples\n", first + i);
+                }
+            }
         }
         vkResetQueryPool(V.device, g_occ_pool, first, n);
         lo += n;
@@ -1669,7 +1752,7 @@ static void occ_reset(void) {
     occ_end();
     if (!g_occ_qn && g_occ_head == g_occ_mark) g_occ_total = 0;      /* nothing queued: the count starts again at once */
     else occ_push(1, 0);
-    g_occ_on = 1;
+    g_occ_on = g_occ_enabled;
 }
 static void occ_report(uint64_t dst) {
     occ_pool();
@@ -1804,8 +1887,10 @@ static VkImageView vt_storage_view(VTex *vt, const EView *e, int ty, VkFormat fm
     for (VView *n = vt->views; n; n = n->next) if (n->attach == 2 && n->vtype == ty && !memcmp(&n->e, &key, sizeof key)) return n->view;
     VView *n = calloc(1, sizeof *n);
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    VkImageViewUsageCreateInfo ui = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     n->e = key; n->vtype = ty; n->attach = 2;
     ci.image = vt->img; ci.format = fmt; ci.viewType = vtype[ty];
+    ui.usage = VK_IMAGE_USAGE_STORAGE_BIT; ci.pNext = &ui;
     ci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ci.subresourceRange.baseMipLevel = (uint32_t)e->lvl0; ci.subresourceRange.levelCount = 1;
     ci.subresourceRange.baseArrayLayer = vt->is3d ? 0 : (uint32_t)e->lay0; ci.subresourceRange.layerCount = vt->is3d ? 1 : (uint32_t)key.nlay;
     VkResult r = vkCreateImageView(V.device, &ci, NULL, &n->view);
@@ -1979,10 +2064,10 @@ static int draw_prepare(unsigned prim) {
             static int want = -2;
             want = passshot_frame() ? 1 : -1;
             if (want >= 0)
-                printf("nvn_vk_draw: prim %u programs vs #%d fs #%d gs #%d target %p | viewport %s %.0f %.0f %.0f %.0f | scissor %s %d %d %d %d | pass %dx%d in_pass %d | cull %u discard %d render_off %d | chanmask %08x blend_on %x blend0 %u %u %u %u %u %u | ds %llx\n",
+                printf("nvn_vk_draw: prim %u programs vs #%d fs #%d gs #%d target %p | viewport %s %.0f %.0f %.0f %.0f | scissor %s %d %d %d %d | pass %dx%d in_pass %d | cull %u discard %d render_off %d | chanmask %08x blend_on %x logic %u blend0 %u %u %u %u %u %u | ds %llx\n",
                        prim, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1, R.prog[2] ? R.prog[2]->serial : -1, (void *)R.col[0].tex, R.have_viewport ? "set" : "default", R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3],
                        R.have_scissor ? "set" : "default", R.scissor[0], R.scissor[1], R.scissor[2], R.scissor[3], R.pass_w, R.pass_h, R.in_pass,
-                       (unsigned)(R.poly[0] & 3), R.rast_discard, R.render_off, R.chanmask, (unsigned)R.blend_on,
+                       (unsigned)(R.poly[0] & 3), R.rast_discard, R.render_off, R.chanmask, (unsigned)R.blend_on, (unsigned)R.logic,
                        R.blend[0][0], R.blend[0][1], R.blend[0][2], R.blend[0][3], R.blend[0][4], R.blend[0][5], (unsigned long long)R.ds);
                 if (want >= 0) printf("nvn_vk_draw:   depth target %p fmt 0x%x %dx%d drange %g..%g polyoff %g %g %g poly %u %u %u %u\n", (void *)R.depth.tex, R.depth.tex ? R.depth.tex->b.format : 0, R.depth.tex ? R.depth.tex->b.width : 0, R.depth.tex ? R.depth.tex->b.height : 0, R.drange[0], R.drange[1], R.polyoff[0], R.polyoff[1], R.polyoff[2], R.poly[0], R.poly[1], R.poly[2], R.poly[3]);
             if (want >= 0) {
@@ -2038,11 +2123,12 @@ static int draw_prepare(unsigned prim) {
         VStage *v = sv[s];
         if (!v) continue;
         Stage *st = &R.prog[s]->st[s];
-        for (unsigned n = 1; n < 18; n++) {
+        for (unsigned n = 0; n < 18; n++) {
             if (!(v->cbufs >> n & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
-            if (n == 2) { b->off = c2_ring(s); b->size = sizeof R.c2[s]; }
+            if (n == 0) b->zero = 1;
+            else if (n == 2) { b->off = c2_ring(s); b->size = sizeof R.c2[s]; }
             else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size); }
             else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b);
             else b->zero = 1;
@@ -2159,7 +2245,7 @@ static int draw_prepare(unsigned prim) {
         for (int s = 0; s < 3; s++) {
             VStage *v = sv[s];
             if (!v) continue;
-            for (unsigned n = 1; n < 34; n++) {
+            for (unsigned n = 0; n < 34; n++) {
                 unsigned bit = n < 18 ? v->cbufs >> n & 1 : v->ssbos >> (n - 18) & 1;
                 if (!bit) continue;
                 BufRef *b = &bufs[ib];
@@ -2293,7 +2379,7 @@ static void write_region(Tex *t, const View *vp, const int *r, const void *data,
     uint64_t off = ring_raw(data, size);
     pass_end(); cmd_begin();
     if (vt->rs) { rs_upload(vt, level, layer, off, (uint32_t)rowlen, (uint32_t)rows, r[0], r[1], r[3], r[4]); t->gpu_written = 1; t->uploaded = 1; return; }      /* */
-    vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vt_transfer_dst(vt);
     VkBufferImageCopy c;
     memset(&c, 0, sizeof c);
     c.bufferOffset = off; c.bufferRowLength = (uint32_t)rowlen; c.bufferImageHeight = (uint32_t)rows;
@@ -2354,7 +2440,7 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
         if (b.srcOffsets[1].x <= b.srcOffsets[0].x) b.srcOffsets[1].x = b.srcOffsets[0].x + 1; if (b.srcOffsets[1].y <= b.srcOffsets[0].y) b.srcOffsets[1].y = b.srcOffsets[0].y + 1;
         if (b.srcOffsets[1].x > lw) { b.srcOffsets[0].x = lw - 1; b.srcOffsets[1].x = lw; } if (b.srcOffsets[1].y > lh) { b.srcOffsets[0].y = lh - 1; b.srcOffsets[1].y = lh; }
         b.dstOffsets[1].x = r[3]; b.dstOffsets[1].y = r[4]; b.dstOffsets[1].z = 1;
-        vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vt_transfer_dst(tmp);
         vkCmdBlitImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tmp->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, rs_filter(vt));
         vt_layout(tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         c.imageSubresource.mipLevel = 0; c.imageSubresource.baseArrayLayer = 0; c.imageSubresource.layerCount = 1; c.imageOffset.x = c.imageOffset.y = c.imageOffset.z = 0;
@@ -2364,6 +2450,16 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
     vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
     if (was != VK_IMAGE_LAYOUT_UNDEFINED) vt_layout(vt, was);
     cmd_wait_all();
+    if (copylog_frame() == nvn_front_frame_next() && t->b.format == 0x25 && vt->w == 1600 && vt->h == 900) {
+        const uint8_t *p = mem.map;
+        size_t pitch = (size_t)(rowlen ? rowlen : (uint64_t)r[3]), rows_out = (size_t)(rows ? rows : (uint64_t)r[4]);
+        size_t center = ((size_t)r[4] / 2 * pitch + (size_t)r[3] / 2) * vt->bpb;
+        size_t last = ((size_t)(r[4] - 1) * pitch + (size_t)r[3] - 1) * vt->bpb;
+        if (rows_out >= (size_t)r[4] && size >= last + vt->bpb)
+            printf("nvn_vk_read: frame %lld tex %p image %p fmt 0x%x rect %d,%d %dx%d layout %d hash %016llx RGBA first %u,%u,%u,%u center %u,%u,%u,%u last %u,%u,%u,%u\n",
+                   (long long)nvn_front_frame_next(), (void *)t, (void *)vt->img, (unsigned)t->b.format, r[0], r[1], r[3], r[4], (int)was, (unsigned long long)copylog_hash(p, (size_t)size),
+                   p[0], p[1], p[2], p[3], p[center], p[center + 1], p[center + 2], p[center + 3], p[last], p[last + 1], p[last + 2], p[last + 3]);
+    }
     memcpy(out, mem.map, (size_t)size);
     vkDestroyBuffer(V.device, buf, NULL); vmem_free(mem);
     R.readbacks++;
@@ -2425,6 +2521,11 @@ static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *
     VTex *vs = vt_get(s), *vd = vt_get(d);
     VkImageBlit b;
     d->gpu_written = 1;
+    if (copylog_frame() == nvn_front_frame_next())
+        printf("nvn_vk_copy: frame %lld tex %p NVN 0x%x Vk %d %dx%dx%d rect %d,%d,%d+%d,%d,%d -> tex %p NVN 0x%x Vk %d %dx%dx%d rect %d,%d,%d+%d,%d,%d filter %s\n",
+               (long long)nvn_front_frame_next(), (void *)s, (unsigned)s->b.format, (int)vs->fmt, s->b.width, s->b.height, s->b.depth,
+               sr[0], sr[1], sr[2], sr[3], sr[4], sr[5], (void *)d, (unsigned)d->b.format, (int)vd->fmt, d->b.width, d->b.height, d->b.depth,
+               dr[0], dr[1], dr[2], dr[3], dr[4], dr[5], linear ? "linear" : "nearest");
     /* a copy within one texture (another level or layer of it, e.g. a mip chain made level by level) goes through the
      * GENERAL layout, with a barrier so that it reads what the copy before it wrote; the same level and layer is refused */
     int same = vs == vd;
@@ -2436,7 +2537,7 @@ static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *
         mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         g_blit_same++;
-    } else { vt_layout(vs, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); vt_layout(vd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL); }
+    } else { vt_layout(vs, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); vt_transfer_dst(vd); }
     memset(&b, 0, sizeof b);
     b.srcSubresource.aspectMask = vs->aspect; b.srcSubresource.mipLevel = sv && (sv->set & 0x81) == 0x81 ? (uint32_t)sv->lvl0 : 0; b.srcSubresource.baseArrayLayer = sv && (sv->set & 0x82) == 0x82 && !vs->is3d ? (uint32_t)sv->lay0 : 0; b.srcSubresource.layerCount = 1;
     b.dstSubresource.aspectMask = vd->aspect; b.dstSubresource.mipLevel = dv && (dv->set & 0x81) == 0x81 ? (uint32_t)dv->lvl0 : 0; b.dstSubresource.baseArrayLayer = dv && (dv->set & 0x82) == 0x82 && !vd->is3d ? (uint32_t)dv->lay0 : 0; b.dstSubresource.layerCount = 1;
@@ -2508,6 +2609,32 @@ static uint64_t quad_indices(uint64_t src, unsigned t, uint32_t count, uint32_t 
 }
 /* The two kinds of draw (nvnCommandBufferDrawArrays* / DrawElements*, and each draw of an indirect one). */
 static LONG64 g_indirect_draws, g_indirect_disp;
+/* SMO_VK_PASSSHOT's frame log: the last fullscreen shader can look like a colour-format problem
+ * when its actual vertex/index data sends the sample coordinates somewhere else. */
+static void debug_program98_vertices(unsigned prim, int indexed, unsigned type, uint64_t indices, uint32_t first, uint32_t count, int32_t base_vertex, uint32_t base_inst, uint32_t inst) {
+    if (!passshot_frame() || !R.prog[0] || R.prog[0]->serial != 98) return;
+    unsigned n = count < 12 ? count : 12;
+    printf("nvn_vk_vtx98: frame %lld %s prim %u count %u type %u first %u base_vertex %d base_instance %u instances %u indices %llx\n",
+           (long long)nvn_front_frame_next(), indexed ? "indexed" : "arrays", prim, count, type, first, base_vertex, base_inst, inst, (unsigned long long)indices);
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t raw = first + i, vertex;
+        if (indexed) raw = type == 0 ? rd8(indices + i) : type == 1 ? rd16(indices + (uint64_t)i * 2) : rd32(indices + (uint64_t)i * 4);
+        int64_t vi = (int64_t)raw + (indexed ? base_vertex : 0);
+        if (vi < 0 || vi > UINT32_MAX) continue;
+        vertex = (uint32_t)vi;
+        uint32_t a = R.vattr[0], st = (a >> 8) & 31, off = a >> 14;
+        uint64_t stride = st < 16 ? R.vstream[st].stride : 0;
+        uint64_t need = (uint64_t)off + (uint64_t)vertex * stride + vattr_size((int)(a & 0xff));
+        uint64_t bound = st < 16 ? R.vbuf[st].size : 0;
+        if (st < 16 && g_vtxgrow && g_vneed[st] > bound) bound = g_vneed[st];
+        if ((a & 0xff) == 0x22 && st < 16 && R.vbuf[st].addr && need <= bound) {
+            const float *v = (const float *)P(R.vbuf[st].addr + off + (uint64_t)vertex * stride);
+            printf("nvn_vk_vtx98:   i %u raw %u vertex %u attr0 %.7g %.7g %.7g expected_uv %.0f %.0f\n",
+                   i, raw, vertex, v[0], v[1], v[2], v[0] < 0 ? 0.0 : 1.0, v[1] > 0 ? 0.0 : 1.0);
+        } else printf("nvn_vk_vtx98:   i %u raw %u vertex %u attr0 unavailable (stream %u size %llu need %llu)\n",
+                      i, raw, vertex, st, (unsigned long long)bound, (unsigned long long)need);
+    }
+}
 static void vk_draw_quads(uint32_t first, uint32_t count, unsigned type, uint64_t indices, int32_t base_vertex, uint32_t base_inst, uint32_t inst) {
     unsigned t = type < 3 ? type : 1;
     uint32_t n;
@@ -2531,6 +2658,7 @@ static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32
     if (gsr) gs_dbg_read(0);
     vtx_switches();
     if (count) vtx_need((uint64_t)first + count - 1, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 0); else memset(g_vneed, 0, sizeof g_vneed);
+    debug_program98_vertices(prim, 0, 0, 0, first, count, 0, base_inst, inst);
     { LONG64 t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
     occ_draw();
     if (R.prog[2]) gsq_begin();
@@ -2552,6 +2680,7 @@ static void vk_draw_elements(unsigned prim, unsigned type, int count, uint64_t i
     if (g_wlog_n && wlog_overlap(0, indices, indices + ((uint64_t)count << t))) GEN_BUMP(GEN_INDEXW);      /* index_max's cache knows generations only */
     {   int64_t mv = (int64_t)index_max(indices, count, t) + base_vertex;
         vtx_need(mv > 0 ? (uint64_t)mv : 0, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 1); }
+    debug_program98_vertices(prim, 1, t, indices, 0, (uint32_t)count, base_vertex, base_inst, inst);
     { LONG64 t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
     vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     occ_draw();
@@ -2827,7 +2956,7 @@ static void exec(const Cmd *m, int depth) {
         if (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !nvn_front_fmt(t->b.format, &f) || f.kind == 4 || vt->decode || vt->expand) { nvn_vk_missing("nvnCommandBufferClearTexture of a depth, compressed or 3-component texture"); break; }
         if (!whole || ((unsigned)a[4] & ((1u << comps) - 1)) != (1u << comps) - 1) { nvn_vk_missing("nvnCommandBufferClearTexture of a part of a level or with a partial channel mask"); break; }
         cmd_begin();
-        vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vt_transfer_dst(vt);
         VkImageSubresourceRange sr = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)level, 1, (uint32_t)(vt->is3d ? 0 : layer), 1};
         VkClearColorValue cv;
         memcpy(&cv, blob + 48, 16);
@@ -2901,6 +3030,7 @@ static void vk_no_grid(void *arg) { nvn_vk_missing("nvnMultisampleStateGetSample
 static void save_bmp_vk(const char *path, VTex *vt) {
     VMem mem;
     int w = vt->w, h = vt->h, bgr = vt->fmt == VK_FORMAT_B8G8R8A8_UNORM || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    int ten = vt->t->b.format == 0x3d || vt->t->b.format == 0x3e;
     if (vt->rs && getenv("SMO_VK_SHOT_NATIVE") && atoi(getenv("SMO_VK_SHOT_NATIVE"))) {      /* the scaled image itself, texel for texel (the default below is the game's size, filtered up as the window shows it) */
         VMem m2;
         uint64_t size = (uint64_t)w * h * 4;
@@ -2924,7 +3054,12 @@ static void save_bmp_vk(const char *path, VTex *vt) {
             fwrite(head, 1, 54, f);
             for (int y = h - 1; y >= 0; y--) {
                 const uint8_t *s = (const uint8_t *)m2.map + (size_t)y * w * 4;
-                for (int x = 0; x < w; x++) { rowb[x * 3] = s[x * 4 + (bgr ? 0 : 2)]; rowb[x * 3 + 1] = s[x * 4 + 1]; rowb[x * 3 + 2] = s[x * 4 + (bgr ? 2 : 0)]; }
+                for (int x = 0; x < w; x++) {
+                    int r, g, b;
+                    if (ten) { uint32_t q; memcpy(&q, s + x * 4, 4); r = (int)((q & 1023) >> 2); g = (int)(((q >> 10) & 1023) >> 2); b = (int)(((q >> 20) & 1023) >> 2); }
+                    else { r = s[x * 4 + (bgr ? 2 : 0)]; g = s[x * 4 + 1]; b = s[x * 4 + (bgr ? 0 : 2)]; }
+                    rowb[x * 3] = (uint8_t)b; rowb[x * 3 + 1] = (uint8_t)g; rowb[x * 3 + 2] = (uint8_t)r;
+                }
                 fwrite(rowb, 1, row, f);
             }
             free(rowb); fclose(f);
@@ -2949,7 +3084,12 @@ static void save_bmp_vk(const char *path, VTex *vt) {
         rowb = calloc(1, row);
         for (int y = h - 1; y >= 0; y--) {
             const uint8_t *s = px + (size_t)y * w * 4;
-            for (int x = 0; x < w; x++) { rowb[x * 3] = s[x * 4 + (bgr ? 0 : 2)]; rowb[x * 3 + 1] = s[x * 4 + 1]; rowb[x * 3 + 2] = s[x * 4 + (bgr ? 2 : 0)]; }
+            for (int x = 0; x < w; x++) {
+                int r, g, b;
+                if (ten) { uint32_t q; memcpy(&q, s + x * 4, 4); r = (int)((q & 1023) >> 2); g = (int)(((q >> 10) & 1023) >> 2); b = (int)(((q >> 20) & 1023) >> 2); }
+                else { r = s[x * 4 + (bgr ? 2 : 0)]; g = s[x * 4 + 1]; b = s[x * 4 + (bgr ? 0 : 2)]; }
+                rowb[x * 3] = (uint8_t)b; rowb[x * 3 + 1] = (uint8_t)g; rowb[x * 3 + 2] = (uint8_t)r;
+            }
             fwrite(rowb, 1, row, f);
         }
         free(rowb); fclose(f);
@@ -2957,9 +3097,20 @@ static void save_bmp_vk(const char *path, VTex *vt) {
     }
     free(px);
 }
+static uint8_t pass_ufloat8(uint32_t v, unsigned mantissa_bits) {
+    uint32_t mant_mask = (1u << mantissa_bits) - 1;
+    unsigned mant = v & mant_mask, exp = (v >> mantissa_bits) & 31;
+    if (exp == 31) return mant ? 0 : 255;              /* NaN -> black, +infinity -> white */
+    float f = exp == 0 ? ldexpf((float)mant, -14 - (int)mantissa_bits)
+                       : ldexpf(1.0f + (float)mant / (float)(1u << mantissa_bits), (int)exp - 15);
+    if (!(f > 0.0f)) return 0;
+    if (f >= 1.0f) return 255;
+    return (uint8_t)(f * 255.0f + 0.5f);
+}
 /* debug aid SMO_VK_PASSSHOT=<frame> (or a range, passshot_frame): at the end of every render pass of that frame,
  * colour target 0 is read back (read_region, the ReadTexels path) and saved as pass_[<frame>_]<n>_<format>.bmp in SMO_SHOT_DIR, with one line of figures
- * (pixels not black, mean of each channel). RGB10A2 (0x3d) is decoded to 8 bits per channel; 8-bit RGBA as is. */
+ * (pixels not black, mean of each channel). RGB10A2 (0x3d) and R11G11B10F (0x3f) are decoded to 8 bits per channel;
+ * 8-bit RGBA is saved as is. */
 static void pass_shot(void) {
     static int want = -2, n, busy;
     want = passshot_frame() ? 1 : -1;
@@ -2968,16 +3119,18 @@ static void pass_shot(void) {
     if (want < 0 || logonly || busy || !R.ncol || !R.col[0].tex || !R.col[0].tex->vk) return;
     static long long last_frame = -1;
     char pre[24] = "";                             /* "<frame>_" before the pass number when a range is captured */
-    if (nvn_front_frame_next() != last_frame) { last_frame = nvn_front_frame_next(); n = 0; }
+    if (passshot_frame_number() != last_frame) { last_frame = passshot_frame_number(); n = 0; }
     if (passshot_range()) snprintf(pre, sizeof pre, "%lld_", last_frame);
     Tex *t = R.col[0].tex;
     VTex *vt = t->vk;
     int half4 = t->b.format == 0x29 && vt->bpb == 8;      /* RGBA16F, shown clamped to 0..1 (alpha too) */
     int half1 = t->b.format == 0x5 && vt->bpb == 2;       /* R16F (linear depth, shadow maps): raw dump + min/max/mean */
+    int level = target_level(&R.col[0]);
+    View *view = &R.col[0].view;
     if (half1) {
-        int w1 = vt->w, h1 = vt->h, r1[6] = {0, 0, 0, w1, h1, 1};
+        int w1 = vt->rs ? lvl_(t->b.width, level) : lvl_(vt->w, level), h1 = vt->rs ? lvl_(t->b.height, level) : lvl_(vt->h, level), r1[6] = {0, 0, 0, w1, h1, 1};
         uint16_t *hp = malloc((size_t)w1 * h1 * 2);
-        if (hp && read_region(t, NULL, r1, hp, 0, 0)) {
+        if (hp && read_region(t, view, r1, hp, 0, 0)) {
             double mn = 1e30, mx = -1e30, sm = 0;
             for (size_t k = 0; k < (size_t)w1 * h1; k++) { uint16_t hv = hp[k]; int ex = (hv >> 10) & 31, man = hv & 1023; float f = ex == 0 ? ldexpf((float)man, -24) : ex == 31 ? 65504.0f : ldexpf(1.0f + man / 1024.0f, ex - 15); if (hv & 0x8000) f = -f; if (f < mn) mn = f; if (f > mx) mx = f; sm += f; }
             printf("nvn_vk_pass: pass %d: %dx%d R16F min %g max %g mean %g\n", n, w1, h1, mn, mx, sm / ((double)w1 * h1));
@@ -2987,12 +3140,12 @@ static void pass_shot(void) {
     }
     if ((vt->bpb != 4 && !half4) || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { printf("nvn_vk_pass: pass %d: colour format 0x%x not captured\n", n++, (unsigned)t->b.format); return; }
     busy = 1;
-    int w = vt->rs ? t->b.width : vt->w, h = vt->rs ? t->b.height : vt->h, rr[6] = {0, 0, 0, w, h, 1};
+    int w = vt->rs ? lvl_(t->b.width, level) : lvl_(vt->w, level), h = vt->rs ? lvl_(t->b.height, level) : lvl_(vt->h, level), rr[6] = {0, 0, 0, w, h, 1};
     uint8_t *px = malloc((size_t)w * h * 4);
     int got = 0;
     if (px && half4) {
         uint16_t *hp = malloc((size_t)w * h * 8);
-        if (hp && read_region(t, NULL, rr, hp, 0, 0)) {
+        if (hp && read_region(t, view, rr, hp, 0, 0)) {
             got = 1;
             for (size_t k = 0; k < (size_t)w * h * 4; k++) {
                 uint16_t hv = hp[k]; int ex = (hv >> 10) & 31, man = hv & 1023;
@@ -3003,12 +3156,15 @@ static void pass_shot(void) {
             if (getenv("SMO_VK_PASSSHOT_RAW")) { char rp[320]; const char *dd = getenv("SMO_SHOT_DIR"); snprintf(rp, sizeof rp, "%s%spass_%s%03d_29_%dx%d.half", dd ? dd : "", dd ? "/" : "", pre, n, w, h); FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(hp, 8, (size_t)w * h, fr); fclose(fr); } }
         }
         free(hp);
-    } else if (px) got = read_region(t, NULL, rr, px, 0, 0) != 0;
+    } else if (px) got = read_region(t, view, rr, px, 0, 0) != 0;
     if (got) {
-        int ten = t->b.format == 0x3d || t->b.format == 0x3e;
+        int ten = t->b.format == 0x3d || t->b.format == 0x3e, ufloat11 = t->b.format == 0x3f;
         long long lit = 0, alpha_hist[4] = {0, 0, 0, 0}; double sum[3] = {0, 0, 0};
-        for (size_t k = 0; k < (size_t)w * h; k++) { uint32_t q; memcpy(&q, px + k * 4, 4); alpha_hist[ten ? q >> 30 : (q >> 24) >> 6]++; }
-        printf("nvn_vk_pass: pass %d: alpha (top two bits) histogram 0:%lld 1:%lld 2:%lld 3:%lld\n", n, alpha_hist[0], alpha_hist[1], alpha_hist[2], alpha_hist[3]);
+        if (ufloat11) printf("nvn_vk_pass: pass %d: alpha n/a (packed R11G11B10F)\n", n);
+        else {
+            for (size_t k = 0; k < (size_t)w * h; k++) { uint32_t q; memcpy(&q, px + k * 4, 4); alpha_hist[ten ? q >> 30 : (q >> 24) >> 6]++; }
+            printf("nvn_vk_pass: pass %d: alpha (top two bits) histogram 0:%lld 1:%lld 2:%lld 3:%lld\n", n, alpha_hist[0], alpha_hist[1], alpha_hist[2], alpha_hist[3]);
+        }
         uint32_t row = ((uint32_t)w * 3 + 3) & ~3u, size = 54 + row * (uint32_t)h, v;
         char path[300];
         const char *dir = getenv("SMO_SHOT_DIR");
@@ -3021,7 +3177,8 @@ static void pass_shot(void) {
             for (int x = 0; x < w; x++) {
                 const uint8_t *s = px + ((size_t)y * w + x) * 4;
                 int r, g, b;
-                if (ten) { uint32_t q; memcpy(&q, s, 4); r = (int)((q & 1023) >> 2); g = (int)(((q >> 10) & 1023) >> 2); b = (int)(((q >> 20) & 1023) >> 2); }
+                if (ufloat11) { uint32_t q; memcpy(&q, s, 4); r = pass_ufloat8(q & 0x7ff, 6); g = pass_ufloat8((q >> 11) & 0x7ff, 6); b = pass_ufloat8((q >> 22) & 0x3ff, 5); }
+                else if (ten) { uint32_t q; memcpy(&q, s, 4); r = (int)((q & 1023) >> 2); g = (int)(((q >> 10) & 1023) >> 2); b = (int)(((q >> 20) & 1023) >> 2); }
                 else { r = s[0]; g = s[1]; b = s[2]; }
                 rowb[x * 3] = (uint8_t)b; rowb[x * 3 + 1] = (uint8_t)g; rowb[x * 3 + 2] = (uint8_t)r;
                 sum[0] += r; sum[1] += g; sum[2] += b; lit += (r | g | b) > 8;
@@ -3034,7 +3191,7 @@ static void pass_shot(void) {
             char rp[320]; snprintf(rp, sizeof rp, "%s%spass_%s%03d_%02x_%dx%d.raw", dir ? dir : "", dir ? "/" : "", pre, n, (unsigned)t->b.format, w, h);
             FILE *fr = fopen(rp, "wb"); if (fr) { fwrite(px, 4, (size_t)w * h, fr); fclose(fr); }
         }
-        printf("nvn_vk_pass: pass %d: %dx%d format 0x%x: %.1f%% not black, mean %.1f %.1f %.1f -> %s\n", n, w, h, (unsigned)t->b.format,
+        printf("nvn_vk_pass: pass %d: %dx%d mip %d format 0x%x: %.1f%% not black, mean %.1f %.1f %.1f -> %s\n", n, w, h, level, (unsigned)t->b.format,
                100.0 * (double)lit / ((double)w * h), sum[0] / ((double)w * h), sum[1] / ((double)w * h), sum[2] / ((double)w * h), path);
     }
     free(px);
@@ -3213,11 +3370,26 @@ static void vk_present(void *arg) { vk_present2(arg, 0); }
 static void vk_present2(void *arg, int progress) {
     PresentJob *j = arg;
     static int shot = -2, every, shot_from, shot_to;
+    static int window_format_logged;
     if (!V.alive) return;
     LONG64 t_present = tk();
     Tex *t = j->win && j->index >= 0 && j->index < j->win->count ? j->win->tex[j->index] : NULL;
     VTex *vt = t && !t->dead ? t->vk : NULL;
+    if (D.debug && !window_format_logged && j->win && t && vt) {
+        printf("nvn_vk: present window index %d/%d; textures:", j->index, j->win->count);
+        for (int i = 0; i < j->win->count && i < 8; i++) {
+            Tex *wt = j->win->tex[i]; VTex *wv = wt && !wt->dead ? wt->vk : NULL;
+            printf(" [%d]=%p NVN 0x%x Vulkan %d %dx%d", i, (void *)wt, wt ? wt->b.format : 0,
+                   wv ? (int)wv->fmt : 0, wv ? wv->w : 0, wv ? wv->h : 0);
+        }
+        printf("\n");
+        window_format_logged = 1;
+    }
     LONG64 frame = nvn_front_frame_next();
+    if (copylog_frame() == frame)
+        printf("nvn_vk_window: frame %lld present index %d/%d tex %p NVN 0x%x Vk %d %dx%d gpu_written %d\n",
+               (long long)frame, j->index, j->win ? j->win->count : 0, (void *)t, t ? (unsigned)t->b.format : 0,
+               vt ? (int)vt->fmt : 0, vt ? vt->w : 0, vt ? vt->h : 0, t ? t->gpu_written : 0);
     {   /* SMO_VK_WD_TEST=<frame>[,<seconds>] holds the render thread at that frame (default 12 s), to see the watchdog's report */
         static int wt = -2, ws = 12;
         if (wt == -2) { const char *e = getenv("SMO_VK_WD_TEST"); wt = e ? atoi(e) : -1; if (e && strchr(e, ',')) ws = atoi(strchr(e, ',') + 1); }
@@ -3575,8 +3747,9 @@ static void vkd_shutdown(void) {
     if (g_occ_reports || g_occ_folds) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         printf("nvn_vk: occlusion counts: %lld reports (%lld written after their frame was presented), %lld compared by a conditional render (%lld of them waited for); "
-               "%lld waits for the GPU, %.0f ms in all (%lld at a present%s); %lld long counts folded%s\n", (long long)g_occ_reports, (long long)g_occ_late, (long long)g_occ_cond,
+               "%lld waits for the GPU, %.0f ms in all (%lld at a present%s); %lld long counts folded; %lld unavailable query results%s\n", (long long)g_occ_reports, (long long)g_occ_late, (long long)g_occ_cond,
                (long long)g_occ_cond_waits, (long long)g_occ_waits, (double)g_occ_wait_ticks * 1000.0 / (double)fq.QuadPart, (long long)g_occ_present_waits,
-               g_occ_present ? "" : ", off: SMO_VK_OCC_PRESENT=0", (long long)g_occ_folds, g_occ_sync ? "; SMO_VK_OCC_SYNC=1: each report waited for" : "");
+               g_occ_present ? "" : ", off: SMO_VK_OCC_PRESENT=0", (long long)g_occ_folds, (long long)g_occ_unavailable,
+               g_occ_sync ? "; SMO_VK_OCC_SYNC=1: each report waited for" : "");
     }
 }
