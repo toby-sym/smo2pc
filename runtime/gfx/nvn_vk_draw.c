@@ -2314,22 +2314,27 @@ static int draw_prepare(unsigned prim) {
     return 1;
 }
 
-/* The pass formats of a target set as the pipeline key holds them (also used by the look-ahead of nvn_vk_pipelines.c on targets
- * that are not bound yet). Returns 0 when one of the images does not exist yet. */
+/* The pass formats of a target set as the pipeline key holds them. The look-ahead calls this before first replay, when a
+ * target may not have a VTex yet; derive that image's format and sample count from its NVN texture builder without making it. */
+static VkFormat pkey_target_format(Tex *t, int *samples) {
+    VTex *vt = t->vk;
+    if (vt) { *samples = vt->samples; return vt->fmt; }
+    int expand = 0, decode = 0;
+    VkFormat f = tex_vkfmt(t->b.format, &expand, &decode);
+    *samples = t->b.samples > 1 ? t->b.samples : 1;
+    return f ? f : VK_FORMAT_R8G8B8A8_UNORM;       /* vt_get uses the same fallback after reporting an unsupported format */
+}
 static int pkey_targets_of(PKey *k, int ncol, const TargetRef *col, const TargetRef *depth) {
-    int all = 1;
     k->ncolor = (uint8_t)ncol; k->samples = 1;
     for (int i = 0; i < ncol; i++) {
         if (!col[i].tex) continue;
-        VTex *vt = col[i].tex->vk;
-        int ex, dec;
-        if (!vt) { all = 0; continue; }
-        VkFormat f = vt->fmt;
-        if ((col[i].view.set & 0x84) == 0x84 && col[i].view.format) { VkFormat f2 = tex_vkfmt(col[i].view.format, &ex, &dec); if (f2 && !ex && !dec) f = f2; }
-        k->cfmt[i] = (int32_t)f; k->samples = (uint8_t)vt->samples;
+        int samples;
+        VkFormat f = pkey_target_format(col[i].tex, &samples);
+        if ((col[i].view.set & 0x84) == 0x84 && col[i].view.format) { int ex, dec; VkFormat f2 = tex_vkfmt(col[i].view.format, &ex, &dec); if (f2 && !ex && !dec) f = f2; }
+        k->cfmt[i] = (int32_t)f; k->samples = (uint8_t)samples;
     }
-    if (depth->tex) { VTex *vt = depth->tex->vk; if (!vt) all = 0; else { k->dfmt = (int32_t)vt->fmt; k->samples = (uint8_t)vt->samples; } }
-    return all;
+    if (depth->tex) { int samples; k->dfmt = (int32_t)pkey_target_format(depth->tex, &samples); k->samples = (uint8_t)samples; }
+    return 1;
 }
 static void pkey_targets(PKey *k) { pkey_targets_of(k, R.ncol, R.col, &R.depth); }
 /* ClearDepthStencil with a stencil mask that is not all bits: Vulkan's clears have no mask, so one triangle over the
@@ -2730,12 +2735,11 @@ static void exec(const Cmd *m, int depth) {
             R.nvn_tex[stage][u] = h;
             if (nvn_front_handle(R.tpool, R.spool, h, &t, &v, &sp) & 1) {      /* what TXQ reports, and whether the shader must use an integer sampler (resolve_handle's rules) */
                 int glevels = nvn_front_tex_levels(t), l0 = (v.set & 0x81) == 0x81 ? v.lvl0 : 0, nl = (v.set & 0x81) == 0x81 && v.nlvl > 0 ? v.nlvl : glevels - l0, is3d = t->b.target == 2;
-                int layers = (v.set & 0x82) == 0x82 && v.nlay > 0 ? v.nlay : nvn_front_tex_layers(t), nf = (v.set & 0x84) == 0x84 && v.format ? v.format : t->b.format, k = nf >= 0x6D ? nf - 0x6D : (nf - 1) % 12;
+                int layers = (v.set & 0x82) == 0x82 && v.nlay > 0 ? v.nlay : nvn_front_tex_layers(t), nf = (v.set & 0x84) == 0x84 && v.format ? v.format : t->b.format;
                 dims[0] = (uint32_t)lvl_(t->b.width, l0); dims[1] = (uint32_t)lvl_(t->b.height, l0);
                 dims[2] = is3d ? (uint32_t)lvl_(t->b.depth, l0) : (uint32_t)(t->b.target == 9 ? layers / 6 : layers);
                 dims[3] = (uint32_t)(nl > 0 ? nl : 1) | ((uint32_t)is3d << 16);
-                if (((nf >= 1 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) && (k == 2 || k == 3 || k == 7 || k == 8 || k == 10 || k == 11)) isint = k == 3 || k == 8 || k == 11 ? 2 : 1;
-                if (nf == 0x3E) isint = 1;
+                isint = scan_texture_int_type(t, &v);
             }
             if (memcmp(&R.c2[stage][48 + 2 * u], dims, 16)) { memcpy(&R.c2[stage][48 + 2 * u], dims, 16); g_c2r[stage].valid = 0; }
             R.tex_int[stage] = (R.tex_int[stage] & ~(1u << u)) | ((uint32_t)(isint != 0) << u);

@@ -1527,8 +1527,19 @@ static void prewarm_start(void) {
  * combination not met before whose stages or pipeline do not exist goes to the FRONT of the worker queue; the replay that
  * follows then finds them made, waits for the one being made, or makes a queued one itself: the work of a frame that needs
  * many new pipelines at once (the first frame of a new scene) is spread over all cores instead of done one by one at the draws.
- * Not followed: integer texture formats (taken as bound now) and, without extended dynamic state 3, anything. */
-typedef struct { Prog *prog[2], *gprog /* a geometry stage is bound (its draws are not followed: gs_pipe_get) */; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
+ * It follows texture-pool and texture-bind commands because integer sampler types specialize the stage. Without extended
+ * dynamic state 3, blend and raster state also change the key and the batch scan is disabled. */
+static int scan_texture_int_type(const Tex *t, const View *v) {
+    if (!t || !v || t->dead) return 0;
+    int nf = (v->set & 0x84) == 0x84 && v->format ? v->format : t->b.format;
+    int k = nf >= 0x6D ? nf - 0x6D : (nf - 1) % 12;
+    if (((nf >= 1 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) &&
+        (k == 2 || k == 3 || k == 7 || k == 8 || k == 10 || k == 11))
+        return k == 3 || k == 8 || k == 11 ? 2 : 1;
+    if (nf == 0x3E) return 1;
+    return 0;
+}
+typedef struct { Prog *prog[2], *gprog /* a geometry stage is bound (its draws are not followed: gs_pipe_get) */; TexPool *tpool; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], tex_int[6], tex_sint[6], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
 static uint64_t g_scan_seen[8192];
 static void scan_sig(Scan *s) {
     memset(&s->sig, 0, sizeof s->sig);
@@ -1537,6 +1548,7 @@ static void scan_sig(Scan *s) {
 }
 static void scan_begin(Scan *s) {
     s->prog[0] = R.prog[0]; s->prog[1] = R.prog[1]; s->gprog = R.prog[2]; s->ncol = R.ncol; memcpy(s->col, R.col, sizeof s->col); s->depth = R.depth;
+    s->tpool = R.tpool; memcpy(s->tex_int, R.tex_int, sizeof s->tex_int); memcpy(s->tex_sint, R.tex_sint, sizeof s->tex_sint);
     s->nattr = R.nattr; memcpy(s->vattr, R.vattr, sizeof s->vattr); s->attr_new = 1; s->logic = R.logic;
     scan_sig(s);
 }
@@ -1553,13 +1565,13 @@ static void scan_draw(Scan *s, unsigned prim) {
             if (nf == 0x6A) { s->ints |= 1u << i; s->sints |= 1u << i; }
         }
     }
-    uint64_t w[6] = {(uint64_t)(uintptr_t)p0->st[0].code ^ ((uint64_t)p0->serial << 44), p1 ? (uint64_t)(uintptr_t)p1->st[1].code ^ ((uint64_t)p1->serial << 44) : 0, s->sig_tag, tclass[prim] | (uint64_t)s->logic << 8 | (uint64_t)(p1 ? p1->sample_shading & 1 : 0) << 16,
-                     (uint64_t)s->ints << 32 | s->sints, (uint64_t)R.tex_int[0] << 32 | R.tex_int[1]};
+    uint64_t w[7] = {(uint64_t)(uintptr_t)p0->st[0].code ^ ((uint64_t)p0->serial << 44), p1 ? (uint64_t)(uintptr_t)p1->st[1].code ^ ((uint64_t)p1->serial << 44) : 0, s->sig_tag, tclass[prim] | (uint64_t)s->logic << 8 | (uint64_t)(p1 ? p1->sample_shading & 1 : 0) << 16,
+                     (uint64_t)s->ints << 32 | s->sints, (uint64_t)s->tex_int[0] << 32 | s->tex_int[1], (uint64_t)s->tex_sint[0] << 32 | s->tex_sint[1]};
     uint64_t tag = fnv(0xcbf29ce484222325ULL, w, sizeof w) | 1;
     unsigned slot = (unsigned)(tag >> 20) & 8191;
     if (g_scan_seen[slot] == tag) return;
     g_scan_seen[slot] = tag;
-    uint32_t key0[4] = {s->ints, s->sints, R.tex_int[0], R.tex_sint[0]}, key1[4] = {0, 0, R.tex_int[1], R.tex_sint[1]};
+    uint32_t key0[4] = {s->ints, s->sints, s->tex_int[0], s->tex_sint[0]}, key1[4] = {0, 0, s->tex_int[1], s->tex_sint[1]};
     VStage *vs = p0->st[0].vk, *fs = p1 ? p1->st[1].vk : NULL;
     int fs_made = !p1 || (fs && fs->state == 2 && fs->fo == 0 && key_fits(1, key1, fs->key, fs->dep, fs->tex_units));
     int vs_made = fs_made && vs && vs->state == 2 && key_fits(0, key0, vs->key, vs->dep, vs->tex_units) && vs->fo == (fs && fs->ok ? fs->in_attr & ~(vs->out_attr & ~vs->fo) : 0);
@@ -1602,6 +1614,23 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
         const uint64_t *a = m->a;
         if (m->size < sizeof(Cmd)) break;
         switch (m->op) {
+        case OP_TEXPOOL: s->tpool = P(a[0]); break;
+        case OP_TEXTURES: {
+            int stage = (int)a[0] % 6, first = (int)a[1], count = (int)a[2];
+            for (int i = 0; i < count && first + i < 32; i++) {
+                uint64_t h;
+                Tex *t = NULL;
+                View v;
+                SamplerParams sp;
+                memcpy(&h, BLOB(m) + i * 8, sizeof h);
+                int isint = 0;
+                if (nvn_front_handle(s->tpool, NULL, h, &t, &v, &sp) & 1) isint = scan_texture_int_type(t, &v);
+                unsigned unit = (unsigned)(first + i);
+                s->tex_int[stage] = (s->tex_int[stage] & ~(1u << unit)) | ((uint32_t)(isint != 0) << unit);
+                s->tex_sint[stage] = (s->tex_sint[stage] & ~(1u << unit)) | ((uint32_t)(isint == 2) << unit);
+            }
+            break;
+        }
         case OP_PROGRAM: for (int st = 0; st < 2; st++) if (a[1] & (1u << st)) { Prog *p = P(a[0]); s->prog[st] = p && !p->dead && p->st[st].state ? p : NULL; }
             if (a[1] & 4u) { Prog *p = P(a[0]); s->gprog = p && !p->dead && p->st[2].state ? p : NULL; }
             break;
@@ -1617,6 +1646,24 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
         case OP_VATTR: s->nattr = (int)a[0] < 32 ? (int)a[0] : 32; memcpy(s->vattr, BLOB(m), (size_t)s->nattr * 4); s->attr_new = 1; break;
         case OP_COLOR: s->logic = ((const uint8_t *)&a[0])[1]; break;
         case OP_DRAW_ARRAYS: case OP_DRAW_ELEMENTS: scan_draw(s, (unsigned)a[0]); break;
+        case OP_DRAW_INDIRECT: {
+            unsigned n = (unsigned)a[4], stride = (unsigned)a[5];
+            int elements = (int)(a[6] & 1);
+            if (!stride) stride = elements ? 20 : 16;
+            if (a[6] & 2) {
+                uint64_t param = 0;
+                memcpy(&param, BLOB(m), sizeof param);
+                uint32_t cnt = 0;
+                if (param) memcpy(&cnt, P(param), sizeof cnt);  /* batch submit synced GPU-written draw counts before scanning */
+                if (cnt < n) n = cnt;
+            }
+            if (a[3] && n) for (unsigned i = 0; i < n; i++) {
+                uint32_t d[5] = {0};
+                memcpy(d, P(a[3] + (uint64_t)i * stride), elements ? 20 : 16);
+                if (d[0] && d[1]) scan_draw(s, (unsigned)a[0]);
+            }
+            break;
+        }
         case OP_CALL: for (int i = 0; i < (int)a[0]; i++) { uint64_t h; memcpy(&h, BLOB(m) + i * 8, 8); if (depth < 8) scan_list(h, depth + 1, s); } break;
         default: break;
         }
