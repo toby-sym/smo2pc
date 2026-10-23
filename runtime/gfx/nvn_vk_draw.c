@@ -205,6 +205,11 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
     bi.size = size; bi.usage = usage; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VKC(vkCreateBuffer(V.device, &bi, NULL, &b));
     vkGetBufferMemoryRequirements(V.device, b, &rq);
+    /* Diagnostic: isolate readbacks from the shared host-visible blocks. */
+    static int dedicated = -1;
+    if (dedicated < 0) { const char *e = getenv("SMO_VK_READ_DEDICATED"); dedicated = e && atoi(e); }
+    if (usage == VK_BUFFER_USAGE_TRANSFER_DST_BIT && dedicated && rq.size <= (16u << 20))
+        rq.size = (16u << 20) + 256;
     *mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1);
     VKC(vkBindBufferMemory(V.device, b, mem->mem, mem->off));
     return b;
@@ -1391,6 +1396,20 @@ static void resolve_sampler(int s, VStage *v, int i) {
     if (r & 1) {
         VTex *vt = vt_get(t);
         EView e;
+        if (copylog_frame() == nvn_front_frame_next() && s == 1 && R.prog[s] && R.prog[s]->serial == 98 &&
+            t->b.width == 1600 && t->b.height == 900 && vt->bpb == 4) {
+            /* Compare the same texel in a tight one-pixel copy and a whole-image
+             * copy before the final sample. This also identifies the exact source
+             * image, rather than inferring it from the last pass's dimensions. */
+            uint32_t pixel = 0, *pixels = malloc((size_t)t->b.width * t->b.height * 4);
+            int one[6] = {800, 450, 0, 1, 1, 1}, whole[6] = {0, 0, 0, 1600, 900, 1};
+            int small_ok = read_region(t, &view, one, &pixel, 0, 0) != 0;
+            int whole_ok = pixels && read_region(t, &view, whole, pixels, 0, 0) != 0;
+            printf("nvn_vk_sample98: frame %lld tex %p image %p NVN 0x%x Vk %d center 800,450 one %d:%08x whole %d:%08x\n",
+                   (long long)nvn_front_frame_next(), (void *)t, (void *)vt->img, (unsigned)t->b.format, (int)vt->fmt,
+                   small_ok, pixel, whole_ok, whole_ok ? pixels[450 * 1600 + 800] : 0);
+            free(pixels);
+        }
         int attached = R.depth.tex == t, dim = v->smp[i].dim;
         for (int k = 0; k < R.ncol; k++) attached |= R.col[k].tex == t;
         eview_of(t, vt, &view, &e);
@@ -2418,6 +2437,8 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
     if (!size) return 0;
     VMem mem;
     VkBuffer buf = vbuf_new(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mem);
+    int copy_trace = copylog_frame() == nvn_front_frame_next();
+    if (copy_trace) memset(mem.map, 0xcd, (size_t)size);
     VkBufferImageCopy c;
     pass_end(); cmd_begin();
     VkImageLayout was = vt->layout;
@@ -2454,6 +2475,13 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
     vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
     if (was != VK_IMAGE_LAYOUT_UNDEFINED) vt_layout(vt, was);
     cmd_wait_all();
+    if (copy_trace) {
+        VKC(vkDeviceWaitIdle(V.device));
+        uint32_t first = 0; memcpy(&first, mem.map, size < 4 ? (size_t)size : 4);
+        printf("nvn_vk_readcheck: tex %p image %p buffer %p memory %p+%llu map %p size %llu rect %d,%d %dx%d first %08x serial %llu done %llu\n",
+               (void *)t, (void *)vt->img, (void *)buf, (void *)mem.mem, (unsigned long long)mem.off, mem.map,
+               (unsigned long long)size, r[0], r[1], r[3], r[4], first, (unsigned long long)R.serial, (unsigned long long)R.done);
+    }
     if (copylog_frame() == nvn_front_frame_next() && t->b.format == 0x25 && vt->w == 1600 && vt->h == 900) {
         const uint8_t *p = mem.map;
         size_t pitch = (size_t)(rowlen ? rowlen : (uint64_t)r[3]), rows_out = (size_t)(rows ? rows : (uint64_t)r[4]);
