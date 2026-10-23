@@ -269,6 +269,17 @@ static int passshot_frame(void) {
     return g_ps_lo >= 0 && f >= g_ps_lo && f <= g_ps_hi && (f - g_ps_lo) % g_ps_step == 0;
 }
 static int passshot_range(void) { if (g_ps_lo == -2) passshot_parse(); return g_ps_hi > g_ps_lo; }
+/* SMO_VK_COPYLOG=<frame>: trace texture blits and the window texture selected for that presentation. */
+static LONG64 g_copylog_frame = -2;
+static LONG64 copylog_frame(void) {
+    if (g_copylog_frame == -2) { const char *e = getenv("SMO_VK_COPYLOG"); g_copylog_frame = e ? atoll(e) : -1; }
+    return g_copylog_frame;
+}
+static uint64_t copylog_hash(const uint8_t *p, size_t n) {
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
 /* NVN counter type 1, SAMPLES_PASSED (occlusion). Between nvnCommandBufferResetCounter and ReportCounter the
  * samples of every draw are counted. A Vulkan occlusion query begun inside a render pass must end in it, so the count is
  * made of segments: one query from the first draw of a pass while counting until the pass (or the counting) ends.
@@ -2392,6 +2403,16 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
     vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
     if (was != VK_IMAGE_LAYOUT_UNDEFINED) vt_layout(vt, was);
     cmd_wait_all();
+    if (copylog_frame() == nvn_front_frame_next() && t->b.format == 0x25 && vt->w == 1600 && vt->h == 900) {
+        const uint8_t *p = mem.map;
+        size_t pitch = (size_t)(rowlen ? rowlen : (uint64_t)r[3]), rows_out = (size_t)(rows ? rows : (uint64_t)r[4]);
+        size_t center = ((size_t)r[4] / 2 * pitch + (size_t)r[3] / 2) * vt->bpb;
+        size_t last = ((size_t)(r[4] - 1) * pitch + (size_t)r[3] - 1) * vt->bpb;
+        if (rows_out >= (size_t)r[4] && size >= last + vt->bpb)
+            printf("nvn_vk_read: frame %lld tex %p image %p fmt 0x%x rect %d,%d %dx%d layout %d hash %016llx RGBA first %u,%u,%u,%u center %u,%u,%u,%u last %u,%u,%u,%u\n",
+                   (long long)nvn_front_frame_next(), (void *)t, (void *)vt->img, (unsigned)t->b.format, r[0], r[1], r[3], r[4], (int)was, (unsigned long long)copylog_hash(p, (size_t)size),
+                   p[0], p[1], p[2], p[3], p[center], p[center + 1], p[center + 2], p[center + 3], p[last], p[last + 1], p[last + 2], p[last + 3]);
+    }
     memcpy(out, mem.map, (size_t)size);
     vkDestroyBuffer(V.device, buf, NULL); vmem_free(mem);
     R.readbacks++;
@@ -2453,6 +2474,11 @@ static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *
     VTex *vs = vt_get(s), *vd = vt_get(d);
     VkImageBlit b;
     d->gpu_written = 1;
+    if (copylog_frame() == nvn_front_frame_next())
+        printf("nvn_vk_copy: frame %lld tex %p NVN 0x%x Vk %d %dx%dx%d rect %d,%d,%d+%d,%d,%d -> tex %p NVN 0x%x Vk %d %dx%dx%d rect %d,%d,%d+%d,%d,%d filter %s\n",
+               (long long)nvn_front_frame_next(), (void *)s, (unsigned)s->b.format, (int)vs->fmt, s->b.width, s->b.height, s->b.depth,
+               sr[0], sr[1], sr[2], sr[3], sr[4], sr[5], (void *)d, (unsigned)d->b.format, (int)vd->fmt, d->b.width, d->b.height, d->b.depth,
+               dr[0], dr[1], dr[2], dr[3], dr[4], dr[5], linear ? "linear" : "nearest");
     /* a copy within one texture (another level or layer of it, e.g. a mip chain made level by level) goes through the
      * GENERAL layout, with a barrier so that it reads what the copy before it wrote; the same level and layer is refused */
     int same = vs == vd;
@@ -3283,6 +3309,10 @@ static void vk_present2(void *arg, int progress) {
         window_format_logged = 1;
     }
     LONG64 frame = nvn_front_frame_next();
+    if (copylog_frame() == frame)
+        printf("nvn_vk_window: frame %lld present index %d/%d tex %p NVN 0x%x Vk %d %dx%d gpu_written %d\n",
+               (long long)frame, j->index, j->win ? j->win->count : 0, (void *)t, t ? (unsigned)t->b.format : 0,
+               vt ? (int)vt->fmt : 0, vt ? vt->w : 0, vt ? vt->h : 0, t ? t->gpu_written : 0);
     {   /* SMO_VK_WD_TEST=<frame>[,<seconds>] holds the render thread at that frame (default 12 s), to see the watchdog's report */
         static int wt = -2, ws = 12;
         if (wt == -2) { const char *e = getenv("SMO_VK_WD_TEST"); wt = e ? atoi(e) : -1; if (e && strchr(e, ',')) ws = atoi(strchr(e, ',') + 1); }

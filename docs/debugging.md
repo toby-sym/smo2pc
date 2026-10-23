@@ -28,6 +28,8 @@ The end of every log has the counts that tell whether a run was healthy:
   the texture behind every binding. `SMO_VK_PASSSHOT=<first>-<last>/<step>` does it for several frames
   (`pass_<frame>_<n>_<format>.bmp`), for defects that show in some frames only. `SMO_VK_PASSSHOT_RAW=1` adds the
   texels as read, for exact values.
+- `SMO_VK_COPYLOG=<frame>` logs texture blits, the window texture selected for that presentation, and hashes plus sample
+  pixels for full-size RGBA readbacks, to trace copies after the final render pass.
 - `SMO_VK_DIAG_NODEPTH=1` draws without depth testing (to see whether something is hidden or missing).
 - `SMO_CAPTURE_AT=<frame>[,<frame>...]` presses the Capture button at those frames (the picture goes to the save
   folder's `album`, as when you press F12); `SMO_CAPTURE_GS=<n>` presses it at n frames that drew with a geometry stage
