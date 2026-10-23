@@ -288,8 +288,9 @@ static uint64_t g_occ_head, g_occ_tail, g_occ_mark, g_occ_seg_serial;   /* next 
 static OccEntry g_occ_q[OCC_Q];
 static int g_occ_qh, g_occ_qn;                     /* oldest entry, entries queued */
 static uint64_t g_occ_total;                       /* samples of the count the resolved entries belong to */
-static int g_occ_sync = -1, g_occ_present = -1;
+static int g_occ_enabled = -1, g_occ_sync = -1, g_occ_present = -1;
 static LONG64 g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_present_waits, g_occ_late;
+static LONG64 g_occ_unavailable;
 static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % OCC_MAX)); g_occ_open = 0; } }
 static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
@@ -1517,14 +1518,20 @@ static void cb_sync(void) {                        /* guest memory must hold wha
     cb_land(mid);
 }
 static void occ_pool(void) {
+    if (g_occ_enabled < 0) {
+        const char *e = getenv("SMO_VK_OCC");
+        g_occ_enabled = !e || atoi(e) != 0;
+        g_occ_sync = getenv("SMO_VK_OCC_SYNC") && atoi(getenv("SMO_VK_OCC_SYNC"));
+        g_occ_present = !getenv("SMO_VK_OCC_PRESENT") || atoi(getenv("SMO_VK_OCC_PRESENT"));
+        if (!g_occ_enabled) printf("nvn_vk: SMO_VK_OCC=0: hardware occlusion queries disabled; reports return 0 samples\n");
+    }
+    if (!g_occ_enabled) { g_occ_on = 0; return; }
     if (g_occ_pool) return;
     if (!D.f12.hostQueryReset) nvn_vk_missing("occlusion counters on a GPU without hostQueryReset");
     VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     qi.queryType = VK_QUERY_TYPE_OCCLUSION; qi.queryCount = OCC_MAX;
     VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_occ_pool));
     vkResetQueryPool(V.device, g_occ_pool, 0, OCC_MAX);
-    g_occ_sync = getenv("SMO_VK_OCC_SYNC") && atoi(getenv("SMO_VK_OCC_SYNC"));
-    g_occ_present = !getenv("SMO_VK_OCC_PRESENT") || atoi(getenv("SMO_VK_OCC_PRESENT"));
 }
 /* SMO_VK_GS_DEBUG=1 or 3 (gs_dbg_mode), draws with a geometry stage. (a) The pipeline statistics of 16 of them (every 25th),
  * printed once the GPU has run them (gsq_poll at every present): primitives in, vertex and geometry invocations, primitives
@@ -1610,13 +1617,25 @@ static int occ_done(uint64_t serial, int wait) {
 }
 /* Segments [lo, hi) have run: their samples are added to *sum (none when sum is NULL) and their queries are free again. */
 static void occ_take(uint64_t lo, uint64_t hi, uint64_t *sum) {
-    static uint64_t res[OCC_MAX];
+    static uint64_t res[OCC_MAX * 2];
     while (lo < hi) {
         uint32_t first = (uint32_t)(lo % OCC_MAX);
         uint32_t n = hi - lo < (uint64_t)(OCC_MAX - first) ? (uint32_t)(hi - lo) : OCC_MAX - first;
         if (sum) {
-            VKC(vkGetQueryPoolResults(V.device, g_occ_pool, first, n, (size_t)n * 8, res, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-            for (uint32_t i = 0; i < n; i++) *sum += res[i];
+            /* occ_resolve calls occ_done first. Read without WAIT_BIT: Intel's Vulkan driver can hang in that
+             * path. Availability also lets us identify and tolerate a query the driver leaves unavailable after
+             * the submission fence has signalled. */
+            memset(res, 0, (size_t)n * 16);
+            VkResult r = vkGetQueryPoolResults(V.device, g_occ_pool, first, n, (size_t)n * 16, res, 16,
+                                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            if (r != VK_SUCCESS && r != VK_NOT_READY) vk_fatal("vkGetQueryPoolResults(occlusion queries)", r);
+            for (uint32_t i = 0; i < n; i++) {
+                if (res[i * 2 + 1]) *sum += res[i * 2];
+                else {
+                    if (InterlockedIncrement64(&g_occ_unavailable) <= 16)
+                        printf("nvn_vk: occlusion query %u unavailable after its submission fence signalled; using 0 samples\n", first + i);
+                }
+            }
         }
         vkResetQueryPool(V.device, g_occ_pool, first, n);
         lo += n;
@@ -1669,7 +1688,7 @@ static void occ_reset(void) {
     occ_end();
     if (!g_occ_qn && g_occ_head == g_occ_mark) g_occ_total = 0;      /* nothing queued: the count starts again at once */
     else occ_push(1, 0);
-    g_occ_on = 1;
+    g_occ_on = g_occ_enabled;
 }
 static void occ_report(uint64_t dst) {
     occ_pool();
@@ -3586,8 +3605,9 @@ static void vkd_shutdown(void) {
     if (g_occ_reports || g_occ_folds) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         printf("nvn_vk: occlusion counts: %lld reports (%lld written after their frame was presented), %lld compared by a conditional render (%lld of them waited for); "
-               "%lld waits for the GPU, %.0f ms in all (%lld at a present%s); %lld long counts folded%s\n", (long long)g_occ_reports, (long long)g_occ_late, (long long)g_occ_cond,
+               "%lld waits for the GPU, %.0f ms in all (%lld at a present%s); %lld long counts folded; %lld unavailable query results%s\n", (long long)g_occ_reports, (long long)g_occ_late, (long long)g_occ_cond,
                (long long)g_occ_cond_waits, (long long)g_occ_waits, (double)g_occ_wait_ticks * 1000.0 / (double)fq.QuadPart, (long long)g_occ_present_waits,
-               g_occ_present ? "" : ", off: SMO_VK_OCC_PRESENT=0", (long long)g_occ_folds, g_occ_sync ? "; SMO_VK_OCC_SYNC=1: each report waited for" : "");
+               g_occ_present ? "" : ", off: SMO_VK_OCC_PRESENT=0", (long long)g_occ_folds, (long long)g_occ_unavailable,
+               g_occ_sync ? "; SMO_VK_OCC_SYNC=1: each report waited for" : "");
     }
 }
