@@ -2901,6 +2901,7 @@ static void vk_no_grid(void *arg) { nvn_vk_missing("nvnMultisampleStateGetSample
 static void save_bmp_vk(const char *path, VTex *vt) {
     VMem mem;
     int w = vt->w, h = vt->h, bgr = vt->fmt == VK_FORMAT_B8G8R8A8_UNORM || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    int ten = vt->t->b.format == 0x3d || vt->t->b.format == 0x3e;
     if (vt->rs && getenv("SMO_VK_SHOT_NATIVE") && atoi(getenv("SMO_VK_SHOT_NATIVE"))) {      /* the scaled image itself, texel for texel (the default below is the game's size, filtered up as the window shows it) */
         VMem m2;
         uint64_t size = (uint64_t)w * h * 4;
@@ -2924,7 +2925,12 @@ static void save_bmp_vk(const char *path, VTex *vt) {
             fwrite(head, 1, 54, f);
             for (int y = h - 1; y >= 0; y--) {
                 const uint8_t *s = (const uint8_t *)m2.map + (size_t)y * w * 4;
-                for (int x = 0; x < w; x++) { rowb[x * 3] = s[x * 4 + (bgr ? 0 : 2)]; rowb[x * 3 + 1] = s[x * 4 + 1]; rowb[x * 3 + 2] = s[x * 4 + (bgr ? 2 : 0)]; }
+                for (int x = 0; x < w; x++) {
+                    int r, g, b;
+                    if (ten) { uint32_t q; memcpy(&q, s + x * 4, 4); r = (int)((q & 1023) >> 2); g = (int)(((q >> 10) & 1023) >> 2); b = (int)(((q >> 20) & 1023) >> 2); }
+                    else { r = s[x * 4 + (bgr ? 2 : 0)]; g = s[x * 4 + 1]; b = s[x * 4 + (bgr ? 0 : 2)]; }
+                    rowb[x * 3] = (uint8_t)b; rowb[x * 3 + 1] = (uint8_t)g; rowb[x * 3 + 2] = (uint8_t)r;
+                }
                 fwrite(rowb, 1, row, f);
             }
             free(rowb); fclose(f);
@@ -2949,7 +2955,12 @@ static void save_bmp_vk(const char *path, VTex *vt) {
         rowb = calloc(1, row);
         for (int y = h - 1; y >= 0; y--) {
             const uint8_t *s = px + (size_t)y * w * 4;
-            for (int x = 0; x < w; x++) { rowb[x * 3] = s[x * 4 + (bgr ? 0 : 2)]; rowb[x * 3 + 1] = s[x * 4 + 1]; rowb[x * 3 + 2] = s[x * 4 + (bgr ? 2 : 0)]; }
+            for (int x = 0; x < w; x++) {
+                int r, g, b;
+                if (ten) { uint32_t q; memcpy(&q, s + x * 4, 4); r = (int)((q & 1023) >> 2); g = (int)(((q >> 10) & 1023) >> 2); b = (int)(((q >> 20) & 1023) >> 2); }
+                else { r = s[x * 4 + (bgr ? 2 : 0)]; g = s[x * 4 + 1]; b = s[x * 4 + (bgr ? 0 : 2)]; }
+                rowb[x * 3] = (uint8_t)b; rowb[x * 3 + 1] = (uint8_t)g; rowb[x * 3 + 2] = (uint8_t)r;
+            }
             fwrite(rowb, 1, row, f);
         }
         free(rowb); fclose(f);
