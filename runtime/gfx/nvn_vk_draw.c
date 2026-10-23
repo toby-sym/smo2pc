@@ -2590,6 +2590,32 @@ static uint64_t quad_indices(uint64_t src, unsigned t, uint32_t count, uint32_t 
 }
 /* The two kinds of draw (nvnCommandBufferDrawArrays* / DrawElements*, and each draw of an indirect one). */
 static LONG64 g_indirect_draws, g_indirect_disp;
+/* SMO_VK_PASSSHOT's frame log: the last fullscreen shader can look like a colour-format problem
+ * when its actual vertex/index data sends the sample coordinates somewhere else. */
+static void debug_program98_vertices(unsigned prim, int indexed, unsigned type, uint64_t indices, uint32_t first, uint32_t count, int32_t base_vertex, uint32_t base_inst, uint32_t inst) {
+    if (!passshot_frame() || !R.prog[0] || R.prog[0]->serial != 98) return;
+    unsigned n = count < 12 ? count : 12;
+    printf("nvn_vk_vtx98: frame %lld %s prim %u count %u type %u first %u base_vertex %d base_instance %u instances %u indices %llx\n",
+           (long long)nvn_front_frame_next(), indexed ? "indexed" : "arrays", prim, count, type, first, base_vertex, base_inst, inst, (unsigned long long)indices);
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t raw = first + i, vertex;
+        if (indexed) raw = type == 0 ? rd8(indices + i) : type == 1 ? rd16(indices + (uint64_t)i * 2) : rd32(indices + (uint64_t)i * 4);
+        int64_t vi = (int64_t)raw + (indexed ? base_vertex : 0);
+        if (vi < 0 || vi > UINT32_MAX) continue;
+        vertex = (uint32_t)vi;
+        uint32_t a = R.vattr[0], st = (a >> 8) & 31, off = a >> 14;
+        uint64_t stride = st < 16 ? R.vstream[st].stride : 0;
+        uint64_t need = (uint64_t)off + (uint64_t)vertex * stride + vattr_size((int)(a & 0xff));
+        uint64_t bound = st < 16 ? R.vbuf[st].size : 0;
+        if (st < 16 && g_vtxgrow && g_vneed[st] > bound) bound = g_vneed[st];
+        if ((a & 0xff) == 0x22 && st < 16 && R.vbuf[st].addr && need <= bound) {
+            const float *v = (const float *)P(R.vbuf[st].addr + off + (uint64_t)vertex * stride);
+            printf("nvn_vk_vtx98:   i %u raw %u vertex %u attr0 %.7g %.7g %.7g expected_uv %.0f %.0f\n",
+                   i, raw, vertex, v[0], v[1], v[2], v[0] < 0 ? 0.0 : 1.0, v[1] > 0 ? 0.0 : 1.0);
+        } else printf("nvn_vk_vtx98:   i %u raw %u vertex %u attr0 unavailable (stream %u size %llu need %llu)\n",
+                      i, raw, vertex, st, (unsigned long long)bound, (unsigned long long)need);
+    }
+}
 static void vk_draw_quads(uint32_t first, uint32_t count, unsigned type, uint64_t indices, int32_t base_vertex, uint32_t base_inst, uint32_t inst) {
     unsigned t = type < 3 ? type : 1;
     uint32_t n;
@@ -2613,6 +2639,7 @@ static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32
     if (gsr) gs_dbg_read(0);
     vtx_switches();
     if (count) vtx_need((uint64_t)first + count - 1, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 0); else memset(g_vneed, 0, sizeof g_vneed);
+    debug_program98_vertices(prim, 0, 0, 0, first, count, 0, base_inst, inst);
     { LONG64 t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
     occ_draw();
     if (R.prog[2]) gsq_begin();
@@ -2634,6 +2661,7 @@ static void vk_draw_elements(unsigned prim, unsigned type, int count, uint64_t i
     if (g_wlog_n && wlog_overlap(0, indices, indices + ((uint64_t)count << t))) GEN_BUMP(GEN_INDEXW);      /* index_max's cache knows generations only */
     {   int64_t mv = (int64_t)index_max(indices, count, t) + base_vertex;
         vtx_need(mv > 0 ? (uint64_t)mv : 0, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 1); }
+    debug_program98_vertices(prim, 1, t, indices, 0, (uint32_t)count, base_vertex, base_inst, inst);
     { LONG64 t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
     vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     occ_draw();
