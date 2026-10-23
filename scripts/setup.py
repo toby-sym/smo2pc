@@ -5,14 +5,14 @@
 
 The game is Super Mario Odyssey 1.4.1. Give either --dump with a decrypted folder (docs/building.md), or --base and
 --update with your own .nsp/.xci files and local Switch keys. The encrypted-container path uses upstream hactool and
-prepares the same decrypted folder locally before continuing. Where the build files go: tools/target.py.
+Ryujinx LibHac to prepare the same decrypted folder locally before continuing. Where build files go: tools/target.py.
 
 Nothing of the game is stored in the repository: every step derives its files from the dump into <repo>/build (ignored
 by git). Steps run in this order and are resumable: a step whose output exists is skipped (--redo <step> repeats it,
 --from <step> repeats it and everything after it); compile, tables and link always run, and only rebuild what changed.
 
-    deps       check Python packages, clang, the Vulkan SDK, SDL3 and the WebView2 SDK
-    decrypt    optional NSP/XCI pair -> build/import/dump using local hactool and local keys
+    deps       check Python packages, native SDKs, and (for NSP/XCI) the .NET SDK
+    decrypt    optional NSP/XCI pair -> build/import/dump using local hactool, LibHac, and keys
     import     your dump -> build/dump (modules as ELF, versions); RomFS and Help read in place  (tools/extract/extract.py)
     functions  every function of each module, with exact boundaries                            (tools/extract/functions.py)
     lift       AArch64 -> C for every function -> build/lift/main                              (tools/lifter/recomp.py)
@@ -31,6 +31,7 @@ import glob
 import importlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -59,7 +60,7 @@ def check_deps(a):
             print('  missing Python package %s (pip install %s)' % (mod, pip))
             ok = False
     clang = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
-    vkh = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
+    vkh = T.vulkan_headers()
     sdl = os.environ.get('SDL3_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'SDL3-*')))), '')
     wv2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
     wv2 = os.path.join(wv2, 'build', 'native', 'include', 'WebView2.h') if wv2 else ''
@@ -68,6 +69,41 @@ def check_deps(a):
         found = bool(path) and os.path.exists(path)
         print('  %-38s %s' % (what, path if found else 'NOT FOUND'))
         ok &= found
+    vswhere = os.path.join(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'),
+                           'Microsoft Visual Studio', 'Installer', 'vswhere.exe')
+    vs_install = ''
+    if os.path.isfile(vswhere):
+        result = subprocess.run([vswhere, '-latest', '-products', '*', '-requires',
+                                 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+                                 '-property', 'installationPath'], capture_output=True, text=True)
+        if result.returncode == 0:
+            vs_install = result.stdout.strip()
+    link = ''
+    if vs_install:
+        versions = sorted(glob.glob(os.path.join(vs_install, 'VC', 'Tools', 'MSVC', '*')), reverse=True)
+        for version in versions:
+            candidate = os.path.join(version, 'bin', 'Hostx64', 'x64', 'link.exe')
+            if os.path.isfile(candidate):
+                link = candidate
+                break
+    link = link or shutil.which('link.exe') or ''
+    print('  %-38s %s' % ('Visual Studio C++ linker (link.exe)', link or 'NOT FOUND'))
+    ok &= bool(link)
+
+    sdk_root = os.environ.get('WindowsSdkDir') or os.path.join(
+        os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'), 'Windows Kits', '10')
+    sdk_versions = sorted(glob.glob(os.path.join(sdk_root, 'Include', '*')), reverse=True)
+    sdk = ''
+    for include in sdk_versions:
+        version = os.path.basename(include)
+        required = (os.path.join(include, 'um', 'Windows.h'),
+                    os.path.join(sdk_root, 'Lib', version, 'um', 'x64', 'user32.lib'),
+                    os.path.join(sdk_root, 'Lib', version, 'ucrt', 'x64', 'ucrt.lib'))
+        if all(os.path.isfile(path) for path in required):
+            sdk = include
+            break
+    print('  %-38s %s' % ('Windows SDK headers and x64 libraries', sdk or 'NOT FOUND'))
+    ok &= bool(sdk)
     if a.dump and not os.path.isdir(a.dump):
         print('  dump folder %s does not exist' % a.dump)
         ok = False
@@ -75,6 +111,19 @@ def check_deps(a):
         if path and not os.path.isfile(path):
             print('  %s package %s does not exist' % (label, path))
             ok = False
+    if a.base:
+        dotnet = shutil.which('dotnet')
+        sdk_versions = []
+        if dotnet:
+            result = subprocess.run([dotnet, '--list-sdks'], capture_output=True, text=True)
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    match = re.match(r'\s*(\d+)\.', line)
+                    if match:
+                        sdk_versions.append(int(match.group(1)))
+        found = bool(sdk_versions and max(sdk_versions) >= 8)
+        print('  %-38s %s' % ('.NET SDK 8 or later (NSP/XCI import)', dotnet if found else 'NOT FOUND'))
+        ok &= found
     return ok
 
 

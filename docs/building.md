@@ -7,20 +7,22 @@ by git). One script does all of it, in steps that resume where they stopped:
 .venv\Scripts\python scripts\setup.py --dump "<folder of your dump>"
 ```
 
-If you already have a decrypted folder dump, the build needs no keys or firmware. For encrypted NSP/XCI inputs, it uses
-your local key files through upstream hactool; neither game content nor keys are included in this repository or sent to
-CI.
+If you already have a decrypted folder dump, the build needs no keys or firmware. For encrypted NSP/XCI inputs,
+upstream hactool extracts the package containers and Ryujinx LibHac reads the NCAs and applies the update's BKTR
+RomFS. Both use keys from your local files. Game content and keys stay on your PC.
 
 ## What you need
 
-- Windows 10/11 x64 and a GPU with Vulkan 1.3 (developed on NVIDIA). The renderer uses
-  `VK_EXT_graphics_pipeline_library`, `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and
-  `VK_EXT_depth_clip_control`.
+- Windows 10/11 x64 and a GPU with Vulkan 1.3. The renderer uses vertex input dynamic state and depth clip control for
+  the game's default NVN depth mode. `VK_EXT_graphics_pipeline_library` and `VK_EXT_extended_dynamic_state3` speed up
+  pipeline work when available; without them it uses ordinary pipelines and fixed pipeline state. Other missing GPU
+  operations are reported and skipped.
 - **Python 3.13** in a virtual environment in the repository:
   ```bat
   py -3.13 -m venv .venv
   .venv\Scripts\python -m pip install lz4 capstone unicorn numpy Pillow
   ```
+- **.NET SDK 8 or later** for the encrypted NSP/XCI import path. It builds the small LibHac reader locally.
 - **LLVM/clang 9.0.0** (the lifted code is compiled with it): unpack it to `C:\llvm-9.0.0` or point `LLVM_ROOT` at it.
 - **Visual Studio 2019 Build Tools** (16.11) with the Windows SDK 10.0.19041: the C runtime and system libraries clang
   links against.
@@ -73,29 +75,31 @@ locally into `build/import/` before the normal import and CPU coverage steps run
 .venv\Scripts\python scripts\setup.py --base "Super Mario Odyssey.nsp" --update "Super Mario Odyssey Update.nsp"
 ```
 
-The encrypted path needs the `prod.keys` dumped from your own console. The importer checks `%USERPROFILE%\.switch`,
+The encrypted path needs `prod.keys` dumped from your own console. The importer checks `%USERPROFILE%\.switch`,
 Ryujinx/Ryubing's `system` folder, and the standard XDG path; you can also pass `--keys "<path to your prod.keys>"`.
-If the package uses rights-ID encryption, hactool also needs the matching `title.keys`; put it beside `prod.keys` or
-pass `--title-keys "<path to your title.keys>"`. Hactool reads title-key entries in the `rights_id = title_key` format
-described in its [external key documentation](https://github.com/SciresM/hactool#external-keys). The files stay on this
-PC. The [Ryubing setup guide](https://docs.ryujinx.app/guides/setup-guide/) describes the emulator's local key folder;
+If a package contains a ticket (`.tik`), LibHac reads its title key into memory for that import. Otherwise, provide the
+matching `title.keys` beside `prod.keys` or pass `--title-keys "<path to your title.keys>"`. Title-key files use the
+`rights_id = title_key` format described in hactool's [external key documentation](https://github.com/SciresM/hactool#external-keys).
+The [Ryubing setup guide](https://docs.ryujinx.app/guides/setup-guide/) describes the emulator's local key folder;
 obtain keys only from your own console.
 The pinned [hactool 1.4.0 Windows release](https://github.com/SciresM/hactool/releases/tag/1.4.0) is downloaded on
 first use into ignored `deps/` and checked against a pinned SHA-256 before it runs. Its ISC license is in
 `licenses/hactool-ISC.txt` and is copied beside the local executable. You can use another hactool executable with
 `--hactool`.
+The pinned Ryujinx LibHac 0.20.0 package is downloaded into ignored `deps/` and checked against its SHA-256 before use.
+Its MIT and third-party license notices are in `licenses/Ryujinx-LibHac-0.20.0.txt`.
 
 For an XCI base cartridge with a separately dumped update, use the XCI for `--base` and the update NSP for `--update`.
-Both packages must resolve to Super Mario Odyssey, and the update control data must report version 1.4.1. The importer
-uses hactool's base-NCA support to apply a BKTR RomFS update. It checks the program id, SDK versions and expected RomFS
-folders before continuing. The ordinary `--dump` route above remains available for files already extracted by a
-homebrew dumper.
+Both packages must resolve to Super Mario Odyssey, and the update control data must report version 1.4.1. LibHac applies
+the update's BKTR RomFS to the base RomFS. The importer checks the program id, SDK versions and expected RomFS folders
+before continuing. The ordinary `--dump` route above remains available for files already extracted by a homebrew
+dumper.
 
 ## The steps
 
 ```
-deps       check the Python packages, clang, the Vulkan SDK, SDL3 and the WebView2 SDK
-decrypt    optional NSP/XCI pair -> build/import/dump using local hactool and local keys
+deps       check Python packages, native SDKs, and .NET when using NSP/XCI inputs
+decrypt    optional NSP/XCI pair -> build/import/dump using hactool, LibHac, and local keys
 import     your decrypted folder -> build/dump (modules as ELF, versions); RomFS and Help read in place
 functions  every function of each module, with exact boundaries                             tools/extract/functions.py
 lift       AArch64 -> C for every function -> build/lift/main                               tools/lifter/recomp.py
@@ -168,7 +172,7 @@ counter is zero.
   `VULKAN_HEADERS`, `SDL3_ROOT`, `WEBVIEW2_ROOT`).
 - **The import stops:** it names the piece it could not find or that is not what it should be (another game, another
   version, an encrypted file). Check the folder layout above. For NSP/XCI input, check that `prod.keys` matches the dump;
-  if hactool reports a missing title key, add the matching local `title.keys` file.
+  if LibHac reports a missing title key, add the matching local `title.keys` file.
 - **The first minutes are slow, or loading screens pause:** shaders are being translated and compiled; the cache in
   `build\cache\vk` makes the next run faster.
 - **"NOT IMPLEMENTED in the Vulkan back end, skipped" in the log:** an NVN feature the renderer does not have yet; the

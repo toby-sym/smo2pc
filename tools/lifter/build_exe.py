@@ -27,7 +27,7 @@ BIN = T.build('bin')
 CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
 SDL3 = os.environ.get('SDL3_ROOT') or os.path.join(REPO, 'deps', 'SDL3-3.4.18')
 WEBVIEW2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
-VKH = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
+VKH = T.vulkan_headers()
 
 # The host runtime's build units by subsystem folder (runtime/<folder>/<file>). Not listed: nvn_vk_draw.c,
 # nvn_vk_pipelines.c and nvn_vk_watchdog.c (included by nvn_vk.c), game_shim.c (part of the game DLL) and
@@ -137,6 +137,12 @@ def build_shader_shim():
     """smo_glslang.dll from runtime/gfx/vk_shaderc_shim.c (see its header for why not glslang's static libraries), plus the
     Vulkan SDK's shaderc_shared.dll beside it; then a self-test: one vertex shader must compile to SPIR-V."""
     import ctypes
+    # The shim loads shaderc_shared.dll by name, then falls back to VULKAN_SDK\Bin. The SDK can live under deps/ and
+    # be discovered from its Include folder without the installer setting VULKAN_SDK, so provide that fallback here.
+    if not os.environ.get('VULKAN_SDK') and VKH:
+        sdk_root = os.path.dirname(os.path.normpath(VKH))
+        if os.path.isfile(os.path.join(sdk_root, 'Bin', 'shaderc_shared.dll')):
+            os.environ['VULKAN_SDK'] = sdk_root
     dll = os.path.join(BIN, 'smo_glslang.dll')
     src = T.runtime('gfx', 'vk_shaderc_shim.c')
     if not os.path.exists(dll) or os.path.getmtime(dll) < os.path.getmtime(src):

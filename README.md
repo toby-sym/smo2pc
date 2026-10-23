@@ -47,8 +47,9 @@ something was not checked, it says so.
 
 ## How it works
 
-1. **Import.** `scripts/setup.py` reads a decrypted dump in place or decrypts your NSP/XCI packages with upstream
-   hactool and your local key files, then converts the program's modules to ELF.
+1. **Import.** `scripts/setup.py` reads a decrypted dump in place or extracts NSP/XCI packages with upstream hactool;
+   Ryujinx LibHac decrypts NCAs and merges the update's BKTR RomFS using your local keys. It then converts the program's
+   modules to ELF.
 2. **Function list.** Every function of the executable, with boundaries from its own unwind tables and symbols (54,214
    in `main`).
 3. **Lifting.** `tools/lifter/recomp.py` turns each AArch64 function into a C function; clang compiles them into a game
@@ -61,11 +62,14 @@ something was not checked, it says so.
 
 ## Requirements
 
-- Windows 10/11 x64 and a Vulkan 1.3 GPU (developed on NVIDIA; `VK_EXT_graphics_pipeline_library`,
-  `VK_EXT_extended_dynamic_state3`, `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
+- Windows 10/11 x64 and a Vulkan 1.3 GPU. The renderer uses vertex input dynamic state and depth clip control for the
+  game's default NVN depth mode. `VK_EXT_graphics_pipeline_library` and `VK_EXT_extended_dynamic_state3` speed up
+  pipeline work when available; the renderer falls back to ordinary pipelines and fixed pipeline state without them.
+  Other missing GPU operations are reported and skipped.
 - Your own *Super Mario Odyssey* dump: either the decrypted folder layout or a base `.nsp`/`.xci` and a 1.4.1 update
   `.nsp`/`.xci`, plus local `prod.keys` and (when needed) `title.keys`. [`docs/building.md`](docs/building.md) lists
   the layouts and key locations.
+- [.NET SDK 8 or later](https://dotnet.microsoft.com/download/dotnet/8.0) when importing encrypted NSP/XCI packages.
 - [LLVM/clang 9.0.0](https://releases.llvm.org/), Visual Studio 2019 Build Tools (16.11) with Windows SDK 10.0.19041,
   the [Vulkan SDK](https://vulkan.lunarg.com/) 1.4, [SDL3](https://github.com/libsdl-org/SDL) 3.4.18, the
   [WebView2 SDK](https://www.nuget.org/packages/Microsoft.Web.WebView2), Python 3.13.
@@ -93,10 +97,10 @@ The first build takes a while (lifting and compiling the game); later runs of `s
 
 ## CI and releases
 
-Every branch push and pull request validates the Python tools and publishes a versioned source ZIP as an Actions
-artifact for 14 days. A tag such as `v0.1.0` publishes a GitHub Release with the source ZIP and its SHA-256 checksum.
-Actions never builds the game executable: that requires a local game dump and Windows graphics SDKs, which stay on
-your PC.
+Every branch push and pull request validates the Python tools and the LibHac importer, then publishes a versioned
+source ZIP as an Actions artifact for 14 days. A tag such as `v0.1.0` publishes a GitHub Release with the source ZIP
+and its SHA-256 checksum. Actions does not build the game executable; that needs a local game dump and Windows graphics
+SDKs, which stay on your PC.
 
 ## Repository layout
 

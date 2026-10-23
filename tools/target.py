@@ -7,6 +7,7 @@ goes under build/:
     build/<the rest>    romfs, manual, functions, lift, obj, gen, bin, run, ... laid out so that the runtime's paths
                         relative to its exe (..\\romfs, ..\\manual, ..\\userdata) work
 """
+import glob
 import os
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,6 +18,16 @@ BASE_DUMP = os.path.join(BUILD, 'dump', 'base')
 RUNTIME = os.path.join(REPO, 'runtime')
 # the host runtime's subsystem folders (runtime/<folder>); every one is an include directory of the runtime's code
 RUNTIME_DIRS = ['core', 'libc', 'os', 'fs', 'gfx', 'audio', 'input', 'services', 'game']
+
+
+def vulkan_headers():
+    """Vulkan SDK Include folder, matching the SDK shipped under deps/ or installed system-wide."""
+    configured = os.environ.get('VULKAN_HEADERS')
+    if configured:
+        return configured
+    candidates = sorted(glob.glob('C:/VulkanSDK/*/Include') +
+                        glob.glob(os.path.join(REPO, 'deps', 'VulkanSDK-*', 'Include')))
+    return candidates[-1] if candidates else ''
 
 
 def runtime(folder, name):
