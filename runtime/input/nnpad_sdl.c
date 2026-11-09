@@ -36,6 +36,7 @@ typedef struct {
     int kb_vk[24];
     int hk_vk;                          /* [hotkeys] amiibo_menu: virtual key, 0 = none */
     unsigned hk_combo;                  /* [hotkeys] amiibo_menu_pad: Pro button bits, 0 = none */
+    unsigned hk_resolution_combo;       /* [hotkeys] resolution_scale_pad: Pro button bits, 0 = none */
 } Cfg;
 typedef struct {
     int used, ignored;
@@ -170,6 +171,8 @@ static const char *const g_default_ini =
 "; no combination. Without this section: F1 and STICK_L+STICK_R (both sticks pressed in).\r\n"
 "amiibo_menu = F1\r\n"
 "amiibo_menu_pad = STICK_L+STICK_R\r\n"
+"; Cycle native / 1080p / 1440p supersampling while playing; this combo is consumed while held.\r\n"
+"resolution_scale_pad = L+R+ZL+ZR\r\n"
 "\r\n"
 "; Per device (GUID from --pad-test). Every key is optional; what is missing falls back to [general] and the built-in default:\r\n"
 "; [device 03000000de280000ff11000000007801]\r\n"
@@ -198,6 +201,7 @@ static void cfg_defaults(Cfg *c) {
     memcpy(c->kb_vk, g_kb_default, sizeof c->kb_vk);
     c->hk_vk = VK_F1;
     c->hk_combo = 1u << 4 | 1u << 5;                      /* STICK_L + STICK_R */
+    c->hk_resolution_combo = 1u << 6 | 1u << 7 | 1u << 8 | 1u << 9; /* L + R + ZL + ZR */
 }
 static unsigned parse_combo(char *v) {                    /* "STICK_L+STICK_R" -> Pro button bits; none / unknown names -> 0 */
     unsigned bits = 0;
@@ -302,6 +306,7 @@ static void cfg_parse(Cfg *c, char *text) {
         } else if (sect == 5) {
             if (!_stricmp(key, "amiibo_menu")) c->hk_vk = parse_vk(val);
             else if (!_stricmp(key, "amiibo_menu_pad")) c->hk_combo = _stricmp(val, "none") ? parse_combo(val) : 0;
+            else if (!_stricmp(key, "resolution_scale_pad")) c->hk_resolution_combo = _stricmp(val, "none") ? parse_combo(val) : 0;
         }
     }
 }
@@ -697,6 +702,10 @@ unsigned nnpad_hotkey_combo(void) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
     return g_cfg.hk_combo;
 }
+unsigned nnpad_resolution_combo(void) {
+    if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
+    return g_cfg.hk_resolution_combo;
+}
 
 /* ================================================================ tools: --pad-test, --pad-map */
 static int active_sources(const Dev *d, char out[][24], int max) {
@@ -967,7 +976,9 @@ int nnpad_selftest(const NnHidHooks *h) {
         int amiibo_menu_take_request(void);
         int took[4];
         amiibo_menu_take_request();
-        check(nnpad_hotkey_vk(0) == VK_F1 && nnpad_hotkey_combo() == (1u << 4 | 1u << 5), "[hotkeys] defaults: the amiibo menu on F1 and on STICK_L+STICK_R");
+        check(nnpad_hotkey_vk(0) == VK_F1 && nnpad_hotkey_combo() == (1u << 4 | 1u << 5) &&
+              nnpad_resolution_combo() == (1u << 6 | 1u << 7 | 1u << 8 | 1u << 9),
+              "[hotkeys] defaults: the amiibo menu on F1 / STICK_L+STICK_R and resolution cycle on L+R+ZL+ZR");
         vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
         SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_LEFT_STICK, true); settle(); h->state(0, &btn, st, &attr); took[0] = amiibo_menu_take_request();
         SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_RIGHT_STICK, true); settle(); h->state(0, &btn, st, &attr); took[1] = amiibo_menu_take_request();
@@ -1072,12 +1083,14 @@ int nnpad_selftest(const NnHidHooks *h) {
         int before = btn == 1ull << 1;
         snprintf(text, sizeof text,
                  "[general]\r\nlayout = positional\r\ndeadzone = 0.10\r\n[keyboard]\r\nplayer = none\r\n"
+                 "[hotkeys]\r\nresolution_scale_pad = A+ZR\r\n"
                  "[device %s]\r\nlayout = labels\r\nmap.PLUS = north, button14\r\nmap.MINUS = none\r\nmap.Y = none\r\naxis.RX = leftx\r\ninvert.LY = on\r\nrumble = off\r\n", g5);
         Sleep(1100);
         write_text(path, text);
         Sleep(1100); nnpad_poll(1);
         h->state(0, &btn, st, &attr);
-        check(before && btn == 1ull << 0, "ini edited while running: reloaded within ~1 s; layout=labels turns south (printed A on this pad) into Pro A");
+        check(before && btn == 1ull << 0 && nnpad_resolution_combo() == (1u << 0 | 1u << 9),
+              "ini edited while running: layout and custom A+ZR resolution chord reload within ~1 s");
         vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
         SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_NORTH, true); settle(); h->state(0, &btn, st, &attr);
         check(btn == 1ull << 10, "remap: north -> Plus (map.PLUS); X no longer gets north");

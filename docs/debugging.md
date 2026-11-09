@@ -2,6 +2,8 @@
 
 The runtime's switches are environment variables with the `SMO_` prefix; pass them to a run with
 `scripts\run.py <run name> --env NAME=VALUE`. Everything a run prints goes to `build\run\<run name>.log`.
+When `smo_native.exe` is launched directly in a console, stdout is buffered and flushed by a low-priority helper so
+diagnostic output does not make the render thread wait on console writes. Redirected logs remain unbuffered.
 
 ## The log at a glance
 
@@ -324,9 +326,13 @@ The end of every log has the counts that tell whether a run was healthy:
 - `SMO_VK_RTLOG=1` logs every new size of image that can be a render target, once: the game's size, format, target,
   layers, samples and mip levels, and the image's size; at exit, `nvn_vk_rt:` lines give every render-target size a
   pass began with, its formats and how many passes used it.
-- Internal resolution scale (`resolution_scale` in `graphics.ini`, 0.25 to 1.0, Vulkan only; `SMO_VK_SCALE=<scale>`
+- Internal resolution scale (`resolution_scale` in `graphics.ini`, 0.25 to 1.6, Vulkan only; `SMO_VK_SCALE=<scale>`
   wins for a run): the game's screen-sized targets (about 16:9, `rs_screen_class` in `nvn_vk_draw.c`) are made at that
-  scale. The log's `nvn_vk_scale:` lines give the scale and the window picture's size at start, and at exit the images
+  scale. 1.2 renders the game's 1600x900 picture at 1920x1080; 1.6 renders it at 2560x1440. The `L+R+ZL+ZR`
+  controller chord cycles native -> 1080p -> 1440p -> native while playing (`resolution_scale_pad` in `controllers.ini`).
+  The change is applied after the current present; live screen targets are rebuilt and their contents blitted to the new size.
+  The log's `nvn_vk_scale:`
+  lines give the scale and the window picture's size at start, and at exit the images
   made scaled, the fragment stages translated for it and the uploads, read-backs and copies that touched a scaled
   image. `SMO_VK_UI_NATIVE=1` (experiment) leaves the window textures at the game's own size.
 - `SMO_FOCUS_TEST=<start s>,<seconds>` (test): from `<start>` the window counts as not active (another program has the

@@ -955,6 +955,21 @@ static volatile LONG g_wk_n;
 static Job *g_jq_head, *g_jq_tail, *g_bq_head, *g_bq_tail;      /* g_bq: the background queue (pair libraries without a program of their own, optimised links): taken only when g_jq is empty */
 static LONG64 g_jq_queued, g_jq_done, g_bq_queued, g_bq_done;
 static LONG64 g_boosts;                            /* times the render thread raised the workers' priority because it waited for one (workers_boost) */
+static int g_rs_workers_paused;
+static void prewarm_wait(void);
+void nvn_vk_rs_workers_pause(int pause) {            /* render thread: a scale change must not race a stage translation */
+    if (pause) prewarm_wait();
+    EnterCriticalSection(&g_sh_lock);
+    if (pause) {
+        while (g_jq_queued != g_jq_done || g_bq_queued != g_bq_done)
+            SleepConditionVariableCS(&g_sh_cv, &g_sh_lock, 100);
+        g_rs_workers_paused = 1;
+    } else {
+        g_rs_workers_paused = 0;
+        WakeAllConditionVariable(&g_jq_cv);
+    }
+    LeaveCriticalSection(&g_sh_lock);
+}
 static void job_push_bg(Job *j) {                  /* g_sh_lock held */
     j->next = NULL;
     if (g_bq_tail) g_bq_tail->next = j; else g_bq_head = j;
@@ -1397,7 +1412,7 @@ static DWORD WINAPI pw_main(void *arg) {
             if (want != prio) { SetThreadPriority(GetCurrentThread(), want); prio = want; }
         }
         EnterCriticalSection(&g_sh_lock);
-        while (!g_jq_head && !g_bq_head && !g_workers_quit) SleepConditionVariableCS(&g_jq_cv, &g_sh_lock, INFINITE);
+        while ((g_rs_workers_paused || (!g_jq_head && !g_bq_head)) && !g_workers_quit) SleepConditionVariableCS(&g_jq_cv, &g_sh_lock, INFINITE);
         Job *j = g_jq_head;
         int bg = 0;
         if (j) { g_jq_head = j->next; if (!g_jq_head) g_jq_tail = NULL; }

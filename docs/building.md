@@ -139,6 +139,10 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   the runtime's switches (see [`debugging.md`](debugging.md)).
 - Graphics and controller settings live in `build\config\graphics.ini` and `build\config\controllers.ini` (written
   with documented defaults on the first run; `controllers.ini` is read again when you edit it while the game runs).
+- Vulkan supersampling: `resolution_scale = 1.2` renders screen targets at 1920x1080; `1.6` renders at 2560x1440.
+  While playing, hold `L+R+ZL+ZR` (keyboard defaults `Q+E+A+S`) to cycle native -> 1080p -> 1440p -> native.
+  Set `[hotkeys] resolution_scale_pad` in `controllers.ini` to another Pro Controller button chord, or `none` to disable it.
+  The chord is consumed while held, and the renderer rebuilds live screen targets at the next present.
 - The window: by default a borderless window of the size in `graphics.ini`, centred (drag it anywhere to move it). F11,
   or a double-click on it, switches between that and borderless fullscreen; `window = borderless_fullscreen` starts that
   way, and `windowed` (with a title bar) and `fullscreen` (on top) are there too. The game keeps running while its

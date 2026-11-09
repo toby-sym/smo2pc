@@ -813,24 +813,27 @@ struct VTex {
 };
 /* ---- internal resolution scale (graphics.ini resolution_scale; SMO_VK_SCALE wins).
  * A texture of the screen class (2D, one layer, attachable, the game's size about 16:9: rs_screen_class) gets an image
- * of round(size * scale); everything the game says in ITS pixels about such an image is converted where it is used:
+ * of round(size * scale); scale below 1.0 reduces resolution, and scale above 1.0 supersamples it. Everything the game says
+ * in ITS pixels about such an image is converted where it is used:
  * viewport, scissor, clear rectangles, copy / blit / resolve / downsample regions, uploads and read-backs (through a
  * temporary image of the game's size), the crop of the present. The size table of the shaders (c2) and the regions the game
  * reads keep the game's sizes. Fragment stages are translated with MxIn.screen_scale (another hash: ssrc_hb). At 1.0 none
  * of this runs: every branch is behind RS_ON or VTex.rs / R.pass_rs, which are then 0. */
 static float g_rs = -1.0f;
+static volatile LONG g_rs_cycle_requested;
 static LONG64 g_rs_images, g_rs_stages, g_rs_fcs, g_rs_tf, g_rs_up, g_rs_down, g_rs_blits;
 static float rs_scale(void) {
     if (g_rs < 0) {
         const char *e = getenv("SMO_VK_SCALE");
         float v = e && atof(e) > 0 ? (float)atof(e) : gfx_options()->scale;
         if (v < 0.25f) v = 0.25f;
-        if (v > 1.0f) v = 1.0f;                    /* above 1.0 (supersampling) is not offered: not tested */
+        if (v > 1.6f) v = 1.6f;                    /* 1.6 = 2560x1440 from the game's 1600x900 screen targets */
         g_rs = v;
     }
     return g_rs;
 }
 #define RS_ON (rs_scale() != 1.0f)
+void nvn_vk_resolution_cycle_request(void) { InterlockedExchange(&g_rs_cycle_requested, 1); }
 /* The game's screen-sized targets (measured with SMO_VK_RTLOG): its window textures (1600 x 900), the title's and every stage's
  * scene buffers (1600 x 900, 1440 x 810 in Cascade Kingdom, ...) and their halvings down to 11 x 6 are all about 16:9; every
  * other target it makes is square, 2:1, 4:1 or upright (shadow and cube maps, look-up tables, icons). So the screen class is
@@ -1700,6 +1703,77 @@ static void tc_shutdown(void) {
     for (int i = 0; i < g_tc_npool; i++) vkDestroyDescriptorPool(V.device, g_tc_pool[i], NULL);
     for (int i = 0; i < TC_BUCKETS; i++) for (int k = 0; k < TC_WAYS; k++) free(g_tc[i][k].list);
     memset(g_tc, 0, sizeof g_tc); g_tc_npool = 0;
+}
+static int rs_tex_eligible(const VTex *vt) {
+    const Tex *t = vt ? vt->t : NULL;
+    if (!t || t->dead || (t->b.target != 1 && t->b.target != 4 && t->b.target != 5) || vt->layers != 1 || vt->decode ||
+        !rs_screen_class((int)t->b.width, (int)t->b.height) || (rs_ui_native() && wintex_is(t))) return 0;
+    Fmt f;
+    return nvn_front_fmt(t->b.format, &f) && (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
+           (f.kind != 4 && fmt_supported(vt->fmt, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)));
+}
+void nvn_vk_rs_workers_pause(int pause);             /* nvn_vk_pipelines.c: no translation may straddle a change of RS_ON */
+/* The settings chord is handled by the input thread, but Vulkan owns the image list. Apply it after a present, with no
+ * command buffer or pipeline worker using the old dimensions. The old screen targets are blitted into their replacements
+ * so the first frame at the new scale keeps the picture and temporal buffers it had at the old one. */
+static void rs_cycle_apply(void) {
+    if (!InterlockedExchange(&g_rs_cycle_requested, 0) || !V.alive) return;
+    float before = rs_scale(), after = before < 1.1f ? 1.2f : before < 1.4f ? 1.6f : 1.0f;
+    int count = 0;
+    for (VTex *vt = g_vtex_all; vt; vt = vt->next) if (rs_tex_eligible(vt)) {
+        if (vt->samples != 1) {
+            printf("nvn_vk_scale: cannot switch from %.2f to %.2f: a live render target has %d samples and cannot be blitted\n", (double)before, (double)after, vt->samples);
+            fflush(stdout);
+            return;
+        }
+        if (!fmt_supported(vt->fmt, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+            printf("nvn_vk_scale: cannot switch from %.2f to %.2f: format %d cannot preserve a live render target by blitting\n", (double)before, (double)after, (int)vt->fmt);
+            fflush(stdout);
+            return;
+        }
+        count++;
+    }
+    VTex **old = count ? malloc(sizeof *old * (size_t)count) : NULL;
+    if (count && !old) { printf("nvn_vk_scale: cannot switch resolution: out of memory for %d live targets\n", count); return; }
+    pass_end();
+    cmd_wait_all();
+    nvn_vk_rs_workers_pause(1);
+    tc_shutdown();
+    g_ndtex = 0;
+    g_rs = after;
+    int nold = 0;
+    for (VTex *vt = g_vtex_all, *next; vt; vt = next) {
+        next = vt->next;
+        if (!rs_tex_eligible(vt)) continue;
+        Tex *t = vt->t;
+        t->vk = NULL;
+        VTex *nv = vt_get2(t, 0);
+        old[nold++] = vt;
+        if (!nv || nv == vt) continue;
+        vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vt_layout(nv, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        int levels = vt->levels < nv->levels ? vt->levels : nv->levels;
+        for (int level = 0; level < levels; level++) {
+            VkImageBlit b;
+            memset(&b, 0, sizeof b);
+            b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = vt->aspect;
+            b.srcSubresource.mipLevel = b.dstSubresource.mipLevel = (uint32_t)level;
+            b.srcSubresource.layerCount = b.dstSubresource.layerCount = 1;
+            b.srcOffsets[1].x = lvl_(vt->w, level); b.srcOffsets[1].y = lvl_(vt->h, level); b.srcOffsets[1].z = 1;
+            b.dstOffsets[1].x = lvl_(nv->w, level); b.dstOffsets[1].y = lvl_(nv->h, level); b.dstOffsets[1].z = 1;
+            cmd_begin();
+            vkCmdBlitImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, nv->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &b, vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        }
+    }
+    cmd_submit(NULL, NULL);
+    cmd_wait_all();
+    for (int i = 0; i < nold; i++) vt_destroy(old[i]);
+    free(old);
+    nvn_vk_rs_workers_pause(0);
+    R.pipe_bound = NULL; R.dyn_dirty = R.vi_dirty = 1; g_dyn_inval = 1;
+    printf("nvn_vk_scale: settings chord changed live supersampling %.2f -> %.2f (%d screen targets rebuilt)\n", (double)before, (double)after, nold);
+    fflush(stdout);
 }
 /* The image view and sampler of one declared sampler of stage s. May end the pass (upload, layout change). */
 static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64_t row_stride, int64_t image_stride);
@@ -4158,6 +4232,7 @@ swap: ;
     g_tm[4] += tk() - t_present;
     nvn_front_frame_end(R.frame_draws, R.frame_skipped, R.frame_clears);
     passshot_update();                             /* the next frame */
+    rs_cycle_apply();                              /* settings chord: rebuild GPU targets before recording another frame */
     { static LONG64 disp_prev; g_in_scene = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_scene) { g_scene_last = frame; g_scene_frames++; } g_frames_counted++; }      /* a frame with compute dispatches: the game draws a scene */
     {   /* per-frame record for the "nvn_vk_gpu_play:" line */
         static LONG64 t_prev;
