@@ -1220,18 +1220,40 @@ static void spawn_stage_fo(const SSrc *src, const uint32_t *key) {      /* as sp
  * a queued stage, pair library or pipeline: the game leaves its loading screen only when everything handed over is ready.
  * On by default with pipeline libraries (SMO_VK_BARRIER=0 / =1 forces it). Time-out 20 s, logged loudly. */
 static LONG64 g_bar_n, g_bar_tk, g_bar_max, g_bar_timeout;
+/* Do not turn every loading-screen frame into another full 20-second wait. The first-run diagnostic spent
+ * minutes behind this barrier while actual draw-time pipeline holds stayed below a second. Keep a small total
+ * warm-up budget for the process; SMO_VK_BARRIER_BUDGET_MS overrides it (0 means no waiting). */
+static LONG64 g_bar_budget_ms = -1;
+static int g_bar_budget_reported;
 static void wd_dump(double stall_s, LONG64 tries_since);     /* nvn_vk_watchdog.c */
 static void loading_barrier(LONG64 frame, LONG64 draws) {
     static int on = -1;
     int want_dump = 0;
     if (on < 0) { const char *e = getenv("SMO_VK_BARRIER"); on = e ? atoi(e) != 0 : D.has_gpl; }
     if (!on || draws > 60 || !g_pw_nthread) return;
+    if (g_bar_budget_ms < 0) {
+        const char *e = getenv("SMO_VK_BARRIER_BUDGET_MS");
+        g_bar_budget_ms = e ? strtoll(e, NULL, 10) : 2000;
+        if (g_bar_budget_ms < 0) g_bar_budget_ms = 0;
+    }
     EnterCriticalSection(&g_sh_lock);
     if (g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) {
         LONG64 t0 = tk();
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        LONG64 budget = g_bar_budget_ms * fq.QuadPart / 1000;
+        LONG64 left = budget - g_bar_tk;
+        if (left <= 0) {
+            if (!g_bar_budget_reported) {
+                g_bar_budget_reported = 1;
+                printf("nvn_vk_barrier: %lld ms total loading wait budget reached; worker warmup continues in the background and a draw may wait for a pipeline\n", (long long)g_bar_budget_ms);
+            }
+            LeaveCriticalSection(&g_sh_lock);
+            return;
+        }
+        LONG64 wait_limit = 20 * fq.QuadPart;
+        if (left < wait_limit) wait_limit = left;
         LONG64 d0 = g_jq_done + g_bq_done, tlast = t0;
-        while ((g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) && tk() - t0 < 20 * fq.QuadPart) {
+        while ((g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) && tk() - t0 < wait_limit) {
             WD_SLEEP(&g_sh_cv, &g_sh_lock, 20);
             if (tk() - t0 > fq.QuadPart * 15 / 100 && tk() - tlast > fq.QuadPart / 10) {      /* held longer than 150 ms: the same picture again, with the progress bar, ten times a second */
                 LONG64 tot = g_jq_queued + g_bq_queued - d0, dn = g_jq_done + g_bq_done - d0;
@@ -1250,8 +1272,12 @@ static void loading_barrier(LONG64 frame, LONG64 draws) {
                 printf("nvn_vk_barrier:   worker %d (thread %lu) busy for %.1f s with job kind %ld (queue %ld) of program #%ld\n", w, (unsigned long)g_wk[w].tid,
                        (double)(tk() - g_wk[w].t0) / (double)fq.QuadPart, (long)(g_wk[w].kind / 10), (long)(g_wk[w].kind % 10), (long)g_wk[w].serial);
         }
-        if (g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) { g_bar_timeout++; printf("nvn_vk_barrier: TIME-OUT at frame %lld: after 20 s the workers still have %lld + %lld jobs: the frame is presented, pipelines may be made at a draw\n", (long long)frame, (long long)(g_jq_queued - g_jq_done), (long long)(g_bq_queued - g_bq_done)); }
+        if ((g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) && dt >= 20 * fq.QuadPart) { g_bar_timeout++; printf("nvn_vk_barrier: TIME-OUT at frame %lld: after 20 s the workers still have %lld + %lld jobs: the frame is presented, pipelines may be made at a draw\n", (long long)frame, (long long)(g_jq_queued - g_jq_done), (long long)(g_bq_queued - g_bq_done)); }
         else if (dt * 10 > fq.QuadPart) printf("nvn_vk_barrier: frame %lld (a loading screen: %lld draws) was held %.0f ms until the workers had finished every queued stage and pipeline\n", (long long)frame, (long long)draws, (double)dt * 1000.0 / (double)fq.QuadPart);
+        if ((g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) && g_bar_tk >= budget && !g_bar_budget_reported) {
+            g_bar_budget_reported = 1;
+            printf("nvn_vk_barrier: %lld ms total loading wait budget reached; worker warmup continues in the background and a draw may wait for a pipeline\n", (long long)g_bar_budget_ms);
+        }
     }
     LeaveCriticalSection(&g_sh_lock);
     if (want_dump) wd_dump(20.0, 0);
@@ -1519,7 +1545,11 @@ static int piperec_cmp(const void *a, const void *b) { return memcmp(a, b, sizeo
 static void prewarm_start(void) {
     InitializeCriticalSection(&g_sh_lock); InitializeCriticalSection(&g_gpl_lock);
     InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
-    CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
+    if (!vkc_mkdirs(vkc_dir())) printf("nvn_vk: could not create cache folder %s (pipeline caches will not persist)\n", vkc_dir());
+    else {
+        vkc_mkdirs(vkc_file("spv"));
+        vkc_mkdirs(vkc_file("stage"));
+    }
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
     {   HMODULE m = LoadLibraryA("smo_glslang.dll");
         g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "smo_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "smo_spirv_free") : NULL;
