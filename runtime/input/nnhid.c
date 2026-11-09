@@ -761,6 +761,18 @@ static volatile LONG64 g_hold_after = -1;                     /* frame the menu 
 static long g_hold_reads;
 static long long g_hold_start, g_hold_read_at;
 static int g_hold_on;
+static int resolution_combo_check(uint32_t id, uint64_t *buttons) {
+    static uint64_t was[8];
+    unsigned combo = nnpad_resolution_combo();
+    int on = id < 8 && combo && ((*buttons & combo) == combo);
+    if (on && (was[id] & combo) != combo) {
+        void nvn_vk_resolution_cycle_request(void);
+        nvn_vk_resolution_cycle_request();
+    }
+    if (id < 8) was[id] = *buttons;
+    if (on) *buttons &= ~(uint64_t)combo;       /* a settings chord should not also trigger game actions */
+    return on;
+}
 static void combo_check(uint32_t id, uint64_t pad) {
     static uint64_t was[8];
     uint64_t combo = (uint64_t)nnpad_hotkey_combo();
@@ -841,6 +853,7 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
         ry = g->ry < -STICK_MAX ? -STICK_MAX : g->ry;
         wired = !g_x[slot].wireless;
     }
+    resolution_combo_check(id, &buttons);       /* settings chord works with either the configured keyboard or a pad */
     if (id == 0) record_or_replay(&buttons, &lx, &ly);
     menu_after(id, &buttons, &lx, &ly);                       /* after the amiibo menu (above) */
     if (lx < -STICK_MAX / 2) buttons |= 1ull << BTN_SL_LEFT;

@@ -57,9 +57,9 @@ static const char *const k_default_ini =
 "console_mode = docked\r\n"
 "\r\n"
 "; resolution_scale = 1.0\r\n"
-";   Internal resolution scale, 0.25 to 1.0 (Vulkan only; OpenGL ignores it). 1.0 = the game's own (its picture is\r\n"
-";   1600x900). 0.75 = 1200x675, 0.5 = 800x450: the main switch for a weak GPU. The whole picture is drawn smaller, the\r\n"
-";   2D interface too (it gets softer), and is scaled to the window size.\r\n"
+";   Internal resolution scale, 0.25 to 1.6 (Vulkan only; OpenGL ignores it). 1.0 = the game's own 1600x900; 1.2 =\r\n"
+";   1920x1080 (1080p supersampling), 1.6 = 2560x1440 (1440p supersampling). Values below 1.0 render smaller; the whole\r\n"
+";   picture, including the 2D interface, is scaled to the window size. Higher values render screen-sized targets larger.\r\n"
 "resolution_scale = 1.0\r\n"
 "\r\n"
 "; anisotropic_filtering = game | 2 | 4 | 8 | 16      (Vulkan)\r\n"
@@ -162,7 +162,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
            o->pause_unfocused ? "pause" : "run", k_vs[o->present], o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off",
            unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
-    if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 1.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.0: the nearest of the two is used\n", o->scale);
+    if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 1.6f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.6: it will be clamped\n", o->scale);
     fflush(stdout);
     return TRUE;
 }
