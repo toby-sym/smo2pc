@@ -703,7 +703,7 @@ unsigned nnpad_hotkey_combo(void) {
     return g_cfg.hk_combo;
 }
 unsigned nnpad_resolution_combo(void) {
-    if (!g_inited) return 1u << 6 | 1u << 7 | 1u << 8 | 1u << 9;
+    if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
     return g_cfg.hk_resolution_combo;
 }
 
@@ -1083,12 +1083,14 @@ int nnpad_selftest(const NnHidHooks *h) {
         int before = btn == 1ull << 1;
         snprintf(text, sizeof text,
                  "[general]\r\nlayout = positional\r\ndeadzone = 0.10\r\n[keyboard]\r\nplayer = none\r\n"
+                 "[hotkeys]\r\nresolution_scale_pad = A+ZR\r\n"
                  "[device %s]\r\nlayout = labels\r\nmap.PLUS = north, button14\r\nmap.MINUS = none\r\nmap.Y = none\r\naxis.RX = leftx\r\ninvert.LY = on\r\nrumble = off\r\n", g5);
         Sleep(1100);
         write_text(path, text);
         Sleep(1100); nnpad_poll(1);
         h->state(0, &btn, st, &attr);
-        check(before && btn == 1ull << 0, "ini edited while running: reloaded within ~1 s; layout=labels turns south (printed A on this pad) into Pro A");
+        check(before && btn == 1ull << 0 && nnpad_resolution_combo() == (1u << 0 | 1u << 9),
+              "ini edited while running: layout and custom A+ZR resolution chord reload within ~1 s");
         vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
         SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_NORTH, true); settle(); h->state(0, &btn, st, &attr);
         check(btn == 1ull << 10, "remap: north -> Plus (map.PLUS); X no longer gets north");

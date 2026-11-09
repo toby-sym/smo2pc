@@ -1721,7 +1721,12 @@ static void rs_cycle_apply(void) {
     float before = rs_scale(), after = before < 1.1f ? 1.2f : before < 1.4f ? 1.6f : 1.0f;
     int count = 0;
     for (VTex *vt = g_vtex_all; vt; vt = vt->next) if (rs_tex_eligible(vt)) {
-        if (vt->samples != 1 || !fmt_supported(vt->fmt, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+        if (vt->samples != 1) {
+            printf("nvn_vk_scale: cannot switch from %.2f to %.2f: a live render target has %d samples and cannot be blitted\n", (double)before, (double)after, vt->samples);
+            fflush(stdout);
+            return;
+        }
+        if (!fmt_supported(vt->fmt, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
             printf("nvn_vk_scale: cannot switch from %.2f to %.2f: format %d cannot preserve a live render target by blitting\n", (double)before, (double)after, (int)vt->fmt);
             fflush(stdout);
             return;
