@@ -32,6 +32,24 @@ The end of every log has the counts that tell whether a run was healthy:
   In particular, an sRGB attachment encodes the shader's linear output even when its base image is RGBA8 UNORM.
 - `SMO_VK_COPYLOG=<frame>` logs texture blits, the window texture selected for that presentation, and hashes plus sample
   pixels for full-size RGBA readbacks, to trace copies after the final render pass.
+- Recording a video: `SMO_SHOT_RANGES=<first>-<last>[/<every>][,...]` saves the frames of several ranges and logs each
+  as `shot: frame <n> audio <sample>`, where that frame falls in the `SMO_AUDIO_WAV` capture, so picture and sound can
+  be put together. A saved frame normally waits for the GPU (about 32 ms); with `SMO_SHOT_ASYNC=1` it is copied on the
+  GPU and written by a thread, and the game keeps its pace (measured: 35 ms per two frames while saving every second
+  one, against 65 ms); a frame that finds no free copy buffer is logged as left out. An asynchronous copy can catch a
+  frame before it is complete (a black sky in a first play frame that synchronous saves never showed).
+- Frames of the test switches (`SMO_SHOT_RANGES`, `SMO_VK_PASSSHOT`, `SMO_VK_OCC_TRACE`, `SMO_VK_FLARELOG`):
+  `<frame>` or `<first>-<last>[/<every>]`, several separated by commas; written `p90` or `p1-p200` they count from the
+  first play frame (known once it is presented: `p1` is the frame after it), so runs whose loading took different times
+  are compared at the same moment of play.
+- `SMO_VK_PASSSHOT=<frames>` saves colour target 0 at the end of every render pass of those frames
+  (`pass_<n>_<format>.bmp`, `pass_<frame>_<n>_<format>.bmp` for several frames) and logs every draw: programs, blend and
+  depth state, viewport, vertex attributes and the texture behind every binding. `SMO_VK_PASSSHOT_RAW=1` adds the
+  texels as read, for exact values; RGBA32F targets print their values instead of a picture;
+  `SMO_VK_PASSSHOT_MAXPX=<n>` reads only targets of at most n pixels (exposure, visibility, the small levels of a bloom
+  chain: cheap enough for hundreds of frames) and `SMO_VK_PASSSHOT_DRAWLOG=0` leaves out the per-draw log.
+- `SMO_VK_FLARELOG=<frames>`: the draws whose vertex stage samples a 1x1 RGBA32F texture (agl's lens flare, scaled by
+  the sun's visibility that agl::sdw::PrimitiveOcclusion adds up there): their constants and fragment texture.
 - `SMO_VK_DIAG_NODEPTH=1` draws without depth testing (to see whether something is hidden or missing).
 - `SMO_CAPTURE_AT=<frame>[,<frame>...]` presses the Capture button at those frames (the picture goes to the save
   folder's `album`, as when you press F12); `SMO_CAPTURE_GS=<n>` presses it at n frames that drew with a geometry stage
@@ -45,12 +63,18 @@ The end of every log has the counts that tell whether a run was healthy:
 ## Shaders
 
 - Translated stages are cached in `build\cache\vk` (`SMO_VK_CACHE=<folder>` uses another one; an empty folder forces
-  every stage to be translated again).
+  every stage to be translated again). The NVIDIA driver keeps the pipeline libraries it compiles in its own disk
+  cache, one per executable name; the played copies and runs with `SMO_VK_CACHE` give it the folder `nv` inside the
+  stage cache (`__GL_SHADER_DISK_CACHE_PATH`, read when the driver loads; one already set is kept), so the PC-wide one
+  (`%LOCALAPPDATA%\NVIDIA\GLCache`, which stops storing anything once its size limit is reached) does not decide how long
+  a start takes. `SMO_VK_NVCACHE=0`: the driver's own folder. An executable of a new name, or one linked again,
+  compiles everything once on its first start.
 - `SMO_VK_GLSLDUMP=<folder>` writes the GLSL of every stage translated in the run.
 - `SMO_SHADERDUMP=<folder>` writes the machine code of stages that could not be translated (`vk_fail_*.bin`); with
   `SMO_VK_DUMP_MINBYTES=<n>` (stages whose GLSL is at least n bytes) or `SMO_VK_DUMP_SERIAL=<n>` (one program; serials
-  change from run to run) it writes `vk_prog_*.bin` for the equivalence harness. `tools\dev\mxdis.py <file.bin>` names
-  the instructions of a dump.
+  change from run to run, but not between runs of the same sequence) it writes `vk_prog_*.bin` for the equivalence
+  harness, the latter also when the program is handed over (its stages may come from the cache).
+  `tools\dev\mxdis.py <file.bin>` names the instructions of a dump.
 - `SMO_MX_NOSTRUCT=1` translates with the old `switch(pc)` control flow instead of structured blocks;
   `SMO_MX_MUTATE=1` plants a known bug, to check that the equivalence harness catches it.
 - Equivalence harness: `tests\build_mx_equiv.py`, then from `build\bin`: `mx_equiv.exe <folder of vk_prog_*.bin> [max]`.
@@ -85,12 +109,41 @@ The end of every log has the counts that tell whether a run was healthy:
   neither neighbour has, and the ones it lacks.
 - `SMO_VK_FRAMELOG=<first>-<last>`: one `nvn_vk_frame:` line per frame (draws, draws left out and why, conditional
   renders, render passes, texture barriers, stream ring wraps and kilobytes streamed).
+- A flash that comes in some runs only: capture `p1-p200` with `SMO_SHOT_ASYNC=1` in several runs, then read what a
+  caught one did with the switches above that cost little (`SMO_VK_PASSSHOT_MAXPX`, `SMO_VK_FLARELOG`,
+  `SMO_VK_OCC_TRACE`); printing a line per draw or per report changes the timing and can hide it.
+- A texture sampled while one of its mip levels is the colour target, in a chain going down its levels (the bloom's
+  downsample): the sampled view stops below the level drawn, as a sampler with mipmaps could otherwise read the level
+  being drawn as the last frame left it (Cascade Kingdom's stage intro: a white veil over the whole picture for one
+  frame, in 7 of 12 runs; 0 of 18 with the clip). `SMO_VK_FEEDBACK_LEVELS=0`: every level always.
+- `SMO_VK_OCC_TRACE=<frames>`: every occlusion count report of those frames is kept with the game's call site, the
+  frame it was written in and the frame the game was building by then, and printed at exit (`nvn_vk_occ_trace:`).
 
 ## Speed
 
 - Every 300 frames the log has `nvn_perf: frames A..B frame time ms: ...` (frame times, fps, 1% low), `nvn_perf: cpu
   ms/frame by thread` and `nvn_vk_perf:` (where the render thread's time went: batch replay, draw preparation, waits for
-  the GPU, present). `nvn_texhash:` says how many textures were checked for changes by hashing their memory, and why.
+  the GPU, present), `nvn_vk_hostmem:` (vertex and index data read in place from the game's heap or streamed, waits
+  before a write of the host into it), `nvn_vk_ring_kinds:` (what the stream ring copied a frame: uniform, storage,
+  vertex, index, other), `nvn_vk_vstage:` (stage lookups that missed the stage's last variant) and, when there were,
+  `nvn_vk_sync:` (fence waits that found compute results not yet in guest memory and landed them first); every 600
+  frames `copy-backs forced by` counts each reason a copy-back of compute results was forced, and the GPU waits it cost.
+  `nvn_texhash:` says how many textures were checked for changes by hashing their memory, and why. At exit, `programs
+  handed over by thread` says which game threads hand their shaders over (boot: InitSystem; a stage: the scene
+  initialisation thread) and how long the hand-over held them.
+- Speed switches, each bringing back the way before (for comparisons): `SMO_VK_HOSTMEM=0` (vertex and index ranges
+  copied into the stream ring instead of read in place from the game's heap, imported into Vulkan with
+  VK_EXT_external_memory_host), `SMO_VK_TSET_CACHE=0` (texture descriptor sets per command buffer instead of kept
+  across them), `SMO_VK_OCC_LATE=0` (a conditional render waits for the occlusion count it compares instead of using the
+  last frame's), `SMO_VK_RT_UPLOAD=1` (a render target the game makes again is read from guest memory),
+  `SMO_VK_TEXAHEAD_LOAD=0` (no larger texture budget during loading screens), `SMO_VK_DYN_ALL=1` (every dynamic state
+  sent at every draw), `SMO_FAST_SKIP=0` (registerSampler's free-slot walk one lifted call per slot), `SMO_HOST_PIN=0`
+  (the render thread, the pipeline workers and the renderer's helper threads anywhere instead of away from the console
+  cores; `SMO_HOST_CPUS=<hex mask>` chooses their processors, `SMO_HOST_LAYOUT=1` gives the render thread a core of its
+  own). `SMO_VK_MT=1` (off by default) runs the look-ahead over a batch on a thread of its own beside the replay. The
+  build: `RECOMP_OPT` (lifted code) and `RECOMP_HOST_OPT` (runtime), both `-O2` by default; `RECOMP_ARCH` adds target
+  flags (e.g. `-march=znver2`: the objects then run on that CPU family and later ones only). A change of them recompiles
+  nothing by itself: `tools\lifter\build_main.py --force`, or delete `build\obj\host`.
 - `nvn_vk_frames:` at exit counts the frames that drew a scene, i.e. had compute dispatches (in the Cap Kingdom run 40,164
   of 42,589; the others are boot and loading frames). Within 600 frames of such a frame the renderer does not hold the
   game's threads for its workers and makes only cheap textures ahead of their use; in a frame that draws a scene its
@@ -115,13 +168,13 @@ The end of every log has the counts that tell whether a run was healthy:
 - `SMO_FAST=0` leaves the game's own code where `runtime/game/smo_fast.c` puts host code in its place (the sort of the
   sampler list of `agl::driver::NVNMgr`); `SMO_FAST_CHECK=1` runs the game's code as well and stops the game if the
   results ever differ. The game's `main` has no symbols for these functions: `tools/lifter/gen_tables.py` finds them
-  by matching the base executable's (in `build\dump\base`), and the log says so when the fast path stays off.
+  by what they do (`find_sampler_sort`), and the log says so when the fast path stays off.
 - Switches that bring back an older behaviour, for comparisons: `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the
   GPU), `SMO_VK_OCC_PRESENT=0` (occlusion results are not waited for at the present), `SMO_VK_RING_DRAIN=1` (the stream
   ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),
   `SMO_VK_NO_TEXBARRIER=1` (the game's fragment-order barriers are ignored), `SMO_SYNC_SUBMIT=1` (every submit waits for
   the render thread), `SMO_VK_VTXGROW=0` (vertex streams are copied only as far as the range the game bound, even when
-  the draw reads further; `SMO_VK_VTXCHECK=1` logs each kind of draw that does). `SMO_PRESENT_ASYNC=1` lets the present not wait for the render thread (one frame in flight);
+  the draw reads further; `SMO_VK_VTXCHECK=1` logs each kind of draw that does). `SMO_PRESENT_ASYNC=0` makes the present wait for the render thread again (by default it does not: one frame in flight);
   `SMO_VK_OCC_LOG=1` logs the conditional renders that had to wait for an occlusion result.
 
 ## Memory
@@ -215,7 +268,7 @@ The end of every log has the counts that tell whether a run was healthy:
   and the start point (the id of a placed start, e.g. a checkpoint flag's `PlayerRestartPos` link; default: the stage's
   default start), and hands it to `GameDataFunction::tryChangeNextStage`; the scene then ends and the game loads the
   stage, a kingdom's home stage with its kingdom. The game's `main` has no symbols for the two functions: they are
-  matched with the base executable's (`GAME_FN_*` in `build\gen\image.h`, see `find_func` in
+  found by what they do (`GAME_FN_*` in `build\gen\image.h`, see `find_game_functions` in
   `tools\lifter\gen_tables.py`). When the
   stage's `StageScene::init` runs, the input sequence starts again: `SMO_SEQ_<n>` for the n-th stage of the list
   (counted from 1), else `SMO_STAGE_SEQ`, else `SMO_SEQ`. The log marks each stage: `stage list: frame F: stage n of N

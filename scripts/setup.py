@@ -16,7 +16,7 @@ by git). Steps run in this order and are resumable: a step whose output exists i
     import     your dump -> build/dump (modules as ELF, versions); RomFS and Help read in place  (tools/extract/extract.py)
     functions  every function of each module, with exact boundaries                            (tools/extract/functions.py)
     lift       AArch64 -> C for every function -> build/lift/main                              (tools/lifter/recomp.py)
-    compile    the lifted C -> objects (clang -O1, incremental)                                (tools/lifter/build_main.py)
+    compile    the lifted C -> objects (clang -O2, incremental)                                (tools/lifter/build_main.py)
     tables     generated headers and tables                                     (tools/lifter/gen_tables.py, gen_sdktest.py)
     sdk        the system-library functions that are lifted too                                 (tools/lifter/sdklift.py)
     link       host runtime + game library -> build/bin/smo_native.exe                          (tools/lifter/build_exe.py)
@@ -86,6 +86,11 @@ def check_deps(a):
             if os.path.isfile(candidate):
                 link = candidate
                 break
+    if not link:
+        # Some Build Tools installs contain the compiler and linker but are not returned by vswhere.
+        root = os.path.join(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'), 'Microsoft Visual Studio')
+        candidates = sorted(glob.glob(os.path.join(root, '*', '*', 'VC', 'Tools', 'MSVC', '*', 'bin', 'Hostx64', 'x64', 'link.exe')))
+        link = candidates[-1] if candidates else ''
     link = link or shutil.which('link.exe') or ''
     print('  %-38s %s' % ('Visual Studio C++ linker (link.exe)', link or 'NOT FOUND'))
     ok &= bool(link)
