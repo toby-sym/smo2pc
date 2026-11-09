@@ -86,6 +86,11 @@ def check_deps(a):
             if os.path.isfile(candidate):
                 link = candidate
                 break
+    if not link:
+        # Some Build Tools installs contain the compiler and linker but are not returned by vswhere.
+        root = os.path.join(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'), 'Microsoft Visual Studio')
+        candidates = sorted(glob.glob(os.path.join(root, '*', '*', 'VC', 'Tools', 'MSVC', '*', 'bin', 'Hostx64', 'x64', 'link.exe')))
+        link = candidates[-1] if candidates else ''
     link = link or shutil.which('link.exe') or ''
     print('  %-38s %s' % ('Visual Studio C++ linker (link.exe)', link or 'NOT FOUND'))
     ok &= bool(link)
