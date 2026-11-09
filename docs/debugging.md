@@ -2,6 +2,8 @@
 
 The runtime's switches are environment variables with the `SMO_` prefix; pass them to a run with
 `scripts\run.py <run name> --env NAME=VALUE`. Everything a run prints goes to `build\run\<run name>.log`.
+When `smo_native.exe` is launched directly in a console, stdout is buffered and flushed by a low-priority helper so
+diagnostic output does not make the render thread wait on console writes. Redirected logs remain unbuffered.
 
 ## The log at a glance
 

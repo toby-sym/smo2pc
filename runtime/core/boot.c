@@ -21,6 +21,28 @@
 #define RET(v) (c->x[0] = (uint64_t)(v))
 #define P(n) ((void *)(uintptr_t)c->x[n])
 
+/* Console writes can block the render thread when a diagnostic line is printed. Keep the
+ * interactive console responsive without making per-line output synchronous; redirected
+ * stdout (run.py's log file) remains unbuffered so its logs stay immediately readable. */
+static char g_stdout_console_buffer[64 * 1024];
+static DWORD WINAPI stdout_flush_worker(LPVOID unused) {
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    for (;;) { Sleep(250); fflush(stdout); }
+}
+static void stdout_init(void) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode;
+    if (h && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+        if (setvbuf(stdout, g_stdout_console_buffer, _IOFBF, sizeof g_stdout_console_buffer) == 0) {
+            HANDLE t = CreateThread(NULL, 0, stdout_flush_worker, NULL, 0, NULL);
+            if (t) CloseHandle(t);
+            return;
+        }
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+}
+
 /* ---- C strings and memory */
 static void i_memcpy(Ctx *c) { memcpy(P(0), P(1), (size_t)A2); }
 static void i_memmove(Ctx *c) { memmove(P(0), P(1), (size_t)A2); }
@@ -244,7 +266,7 @@ static DWORD WINAPI guest_main(LPVOID arg) {
 
 int main(int argc, char **argv) {
     g_elf = argc > 1 ? argv[1] : GAME_ELF_DEFAULT;   /* the target's main.elf from the exe's folder (image.h) */
-    setvbuf(stdout, NULL, _IONBF, 0);
+    stdout_init();
     {   /* pad tools and their self-test (nnpad_sdl.c): no game is started */
         int nnhid_pad_selftest(void), nnpad_tool(int, char **);
         int tool;
