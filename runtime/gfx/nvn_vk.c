@@ -241,6 +241,16 @@ static void *vk_sym(const char *name) {
  * copies' cache would fill their folder with a cache of its own. A path already set in the environment is kept;
  * SMO_VK_NVCACHE=0 leaves the driver's folder. */
 static const char *vkc_dir(void);                  /* nvn_vk_pipelines.c */
+static int vkc_mkdirs(const char *path) {
+    char full[MAX_PATH];
+    if (!_fullpath(full, path, sizeof full)) return 0;
+    for (char *p = full + 3; *p; p++) if (*p == '\\' || *p == '/') {
+        char sep = *p; *p = 0; CreateDirectoryA(full, NULL); *p = sep;
+    }
+    CreateDirectoryA(full, NULL);
+    DWORD attr = GetFileAttributesA(full);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+}
 static void nv_cache_dir(void) {
     const char *off = getenv("SMO_VK_NVCACHE"), *set = getenv("__GL_SHADER_DISK_CACHE_PATH"), *own = getenv("SMO_VK_CACHE");
     char rel[260], dir[260], exe[MAX_PATH] = "";
@@ -254,8 +264,10 @@ static void nv_cache_dir(void) {
     }
     snprintf(rel, sizeof rel, "%s/nv", vkc_dir());
     if (!_fullpath(dir, rel, sizeof dir)) return;
-    CreateDirectoryA(vkc_dir(), NULL);
-    CreateDirectoryA(dir, NULL);
+    if (!vkc_mkdirs(vkc_dir()) || !vkc_mkdirs(dir)) {
+        printf("nvn_vk: could not create the shader cache folder %s (cache will not persist)\n", dir);
+        return;
+    }
     SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_PATH", dir);
     if (!getenv("__GL_SHADER_DISK_CACHE_SIZE")) SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_SIZE", "8589934592");      /* 8 GB, in bytes */
     printf("nvn_vk: the driver's shader disk cache: %s (the game's own; SMO_VK_NVCACHE=0: the driver's folder)\n", dir);
