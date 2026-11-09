@@ -117,17 +117,14 @@ def resolve_libhac_installer():
 
 
 @contextlib.contextmanager
-def hactool_environment(root, title_keys):
-    """Make a user-selected title.keys visible through hactool's standard key lookup, then remove the copy."""
+def hactool_environment(root):
+    """Keep hactool's standard key lookup isolated while it only unpacks outer package containers."""
     env = os.environ.copy()
-    if title_keys:
-        home = root / 'key-home'
-        switch = home / '.switch'
-        switch.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(title_keys, switch / 'title.keys')
-        env['HOME'] = str(home)
-        env['USERPROFILE'] = str(home)
-        env.pop('XDG_CONFIG_HOME', None)
+    home = root / 'key-home'
+    (home / '.switch').mkdir(parents=True, exist_ok=True)
+    env['HOME'] = str(home)
+    env['USERPROFILE'] = str(home)
+    env.pop('XDG_CONFIG_HOME', None)
     yield env
 
 
@@ -143,7 +140,7 @@ def sanitized_failure(output):
 def run_hactool(tool, keys, env, args, context):
     command = [str(tool)]
     if keys:
-        command.extend(('-k', str(keys)))
+        command.append('-k')
     command.extend(args)
     completed = subprocess.run(command, cwd=str(REPO), env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True, errors='replace')
@@ -165,7 +162,9 @@ def package_files(tool, keys, env, source, destination):
         args = ['-t', 'xci', '--outdir=' + str(destination), '--suppresskeys', str(source)]
     else:
         raise ContainerError('%s must be an .nsp or .xci' % source.name)
-    run_hactool(tool, keys, env, args, 'extracting %s' % source.name)
+    # hactool only unpacks the outer PFS0/XCI container here; LibHac decrypts the NCAs below.
+    # Loading the keyset at this stage rejects newer, otherwise irrelevant entries in prod.keys.
+    run_hactool(tool, None, env, args, 'extracting %s' % source.name)
     entries = sorted(destination.rglob('*.nca'))
     if not entries:
         raise ContainerError('%s contained no readable NCA files' % source.name)
@@ -231,7 +230,7 @@ def prepare_dump(base_path, update_path, keys_path=None, title_keys_path=None,
     build.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='smo2pc-import-', dir=str(build)) as temporary:
         work = pathlib.Path(temporary)
-        with hactool_environment(work, title_keys) as env:
+        with hactool_environment(work) as env:
             print('Extracting package containers with hactool (keys remain local)...')
             base_package = work / 'base-package'
             update_package = work / 'update-package'
