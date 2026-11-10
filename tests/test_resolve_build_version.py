@@ -1,11 +1,13 @@
 import os
-import sys
+import importlib.util
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tools import resolve_build_version
+resolver_path = Path(__file__).resolve().parents[1] / 'tools' / 'resolve-build-version.py'
+resolver_spec = importlib.util.spec_from_file_location('resolve_build_version', resolver_path)
+resolve_build_version = importlib.util.module_from_spec(resolver_spec)
+resolver_spec.loader.exec_module(resolve_build_version)
 
 
 class ResolveBuildVersionTests(unittest.TestCase):
