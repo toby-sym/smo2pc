@@ -76,6 +76,12 @@ something was not checked, it says so.
 
 ## Quick start
 
+For a guided Windows build, download and extract the **Windows builder** ZIP from a GitHub Release and run
+`SMO2PC.Builder.exe`. It lets you select your own `prod.keys`, optional `title.keys`, base NSP/XCI and the 1.4.1 update
+NSP/XCI, then runs the normal resumable build locally. See [`docs/builder.md`](docs/builder.md) for its requirements.
+
+You can also run the existing command-line flow directly:
+
 ```bat
 py -3.13 -m venv .venv
 .venv\Scripts\python -m pip install lz4 capstone unicorn numpy Pillow
@@ -97,10 +103,10 @@ The first build takes a while (lifting and compiling the game); later runs of `s
 
 ## CI and releases
 
-Every branch push and pull request validates the Python tools and the LibHac importer, then publishes a versioned
-source ZIP as an Actions artifact for 14 days. A tag such as `v0.1.0` publishes a GitHub Release with the source ZIP
-and its SHA-256 checksum. Actions does not build the game executable; that needs a local game dump and Windows graphics
-SDKs, which stay on your PC.
+Every branch push and pull request validates the Python tools and LibHac importer, then publishes source and Windows
+builder ZIPs as Actions artifacts for 14 days. A tag such as `v0.1.0` publishes a GitHub Release with both ZIPs and
+their SHA-256 checksums. The builder runs the game build on your PC; Actions does not build or distribute a game
+executable because your game dump, keys and Windows graphics toolchain stay local.
 
 ## Repository layout
 

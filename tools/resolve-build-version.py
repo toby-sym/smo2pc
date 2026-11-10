@@ -67,7 +67,7 @@ def resolve():
         'tag': tag,
         'ref': ref,
         'channel': channel,
-        'artifact': 'smo2pc-%s-source' % version,
+        'artifact': 'smo2pc-%s-builds' % version,
     }
 
 

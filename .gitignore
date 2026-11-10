@@ -65,3 +65,6 @@ __pycache__/
 .venv/
 **/bin/
 **/obj/
+builder/ui/node_modules/
+builder/ui/dist/
+builder/ui/*.tsbuildinfo

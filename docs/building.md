@@ -3,6 +3,9 @@
 Everything the build makes from the game is derived from **your own dump** on **your own PC**, into `build/` (ignored
 by git). One script does all of it, in steps that resume where they stopped:
 
+For the guided Windows app, see [`builder.md`](builder.md). It collects the NSP/XCI and key file paths and invokes this
+same script locally.
+
 ```bat
 .venv\Scripts\python scripts\setup.py --dump "<folder of your dump>"
 ```

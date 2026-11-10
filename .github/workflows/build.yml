@@ -64,7 +64,7 @@ jobs:
       ref: ${{ needs.prepare.outputs.ref }}
 
   package:
-    name: Source bundle
+    name: Windows builder and source bundle
     needs: [prepare, verify]
     runs-on: windows-latest
     steps:
@@ -74,11 +74,26 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: builder/ui/package-lock.json
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build React builder interface
+        working-directory: builder/ui
+        run: |
+          npm ci
+          npm run build
+      - name: Publish standalone Windows builder
+        run: dotnet publish builder/app/Smo2pc.Builder.csproj --configuration Release --runtime win-x64 --self-contained true --nologo -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugSymbols=false -p:DebugType=None --output artifacts/builder-app
       - name: Package source and checksum
         env:
           BUILD_VERSION: ${{ needs.prepare.outputs.version }}
-        run: python tools/package-source.py --version $env:BUILD_VERSION
-      - name: Upload versioned source bundle
+        run: python tools/package-source.py --version $env:BUILD_VERSION --builder-publish artifacts/builder-app
+      - name: Upload versioned build packages
         uses: actions/upload-artifact@v7
         with:
           name: ${{ needs.prepare.outputs.artifact }}
@@ -143,7 +158,7 @@ jobs:
             fi
             echo "Release tag $RELEASE_TAG in $GH_REPO already points to built commit $SOURCE_COMMIT."
           fi
-      - name: Publish tagged source bundle
+      - name: Publish versioned build packages
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
