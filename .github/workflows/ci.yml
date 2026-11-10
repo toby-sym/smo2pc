@@ -27,6 +27,8 @@ jobs:
           dotnet-version: '8.0.x'
       - name: Check Python syntax
         run: python -m compileall -q scripts tools tests
+      - name: Test build version resolution
+        run: python -m unittest discover -s tests -p test_resolve_build_version.py
       - name: Build the LibHac NCA importer
         run: |
           python scripts/install_libhac.py

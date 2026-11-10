@@ -14,7 +14,7 @@ on:
         default: dev
         options: [dev, release]
       tag_name:
-        description: Existing release tag (vX.Y.Z); leave empty for dev
+        description: Release tag to create (vX.Y.Z); leave empty for dev
         type: string
         required: false
   workflow_call:
@@ -100,6 +100,49 @@ jobs:
         with:
           name: ${{ needs.prepare.outputs.artifact }}
           path: release-assets
+      - name: Create release tag at the built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.ref }}
+        run: |
+          set -euo pipefail
+          resolve_tag_commit() {
+            local tag_data tag_type tag_sha
+            tag_data="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" \
+              --jq '[.object.type, .object.sha] | @tsv')"
+            IFS=$'\t' read -r tag_type tag_sha <<< "$tag_data"
+            while [ "$tag_type" = "tag" ]; do
+              tag_data="$(gh api "repos/$GH_REPO/git/tags/$tag_sha" \
+                --jq '[.object.type, .object.sha] | @tsv')"
+              IFS=$'\t' read -r tag_type tag_sha <<< "$tag_data"
+            done
+            if [ "$tag_type" != "commit" ]; then
+              echo "Release tag $RELEASE_TAG resolves to unexpected object type '$tag_type'." >&2
+              return 1
+            fi
+            printf '%s' "$tag_sha"
+          }
+
+          tag_object="$(gh api --method POST "repos/$GH_REPO/git/tags" \
+            -f "tag=$RELEASE_TAG" \
+            -f "message=Release $RELEASE_VERSION" \
+            -f "object=$SOURCE_COMMIT" \
+            -f "type=commit" --jq .sha)"
+          if gh api --method POST "repos/$GH_REPO/git/refs" \
+            -f "ref=refs/tags/$RELEASE_TAG" \
+            -f "sha=$tag_object" >/dev/null; then
+            echo "Created release tag $RELEASE_TAG in $GH_REPO at $SOURCE_COMMIT."
+          else
+            tag_commit="$(resolve_tag_commit)"
+            if [ "$tag_commit" != "$SOURCE_COMMIT" ]; then
+              echo "Refusing to move release tag $RELEASE_TAG in $GH_REPO: tag target is $tag_commit; built commit is $SOURCE_COMMIT." >&2
+              exit 1
+            fi
+            echo "Release tag $RELEASE_TAG in $GH_REPO already points to built commit $SOURCE_COMMIT."
+          fi
       - name: Publish tagged source bundle
         env:
           GH_TOKEN: ${{ github.token }}
@@ -108,9 +151,17 @@ jobs:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.ref }}
         run: |
-          tag_commit="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha 2>/dev/null || true)"
-          if [ -n "$tag_commit" ] && [ "$tag_commit" != "$SOURCE_COMMIT" ]; then
-            echo "The release tag moved after the source bundle was prepared." >&2
+          set -euo pipefail
+          tag_data="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" \
+            --jq '[.object.type, .object.sha] | @tsv')"
+          IFS=$'\t' read -r tag_type tag_sha <<< "$tag_data"
+          while [ "$tag_type" = "tag" ]; do
+            tag_data="$(gh api "repos/$GH_REPO/git/tags/$tag_sha" \
+              --jq '[.object.type, .object.sha] | @tsv')"
+            IFS=$'\t' read -r tag_type tag_sha <<< "$tag_data"
+          done
+          if [ "$tag_type" != "commit" ] || [ "$tag_sha" != "$SOURCE_COMMIT" ]; then
+            echo "Release tag $RELEASE_TAG in $GH_REPO resolves to $tag_type $tag_sha; built commit is $SOURCE_COMMIT." >&2
             exit 1
           fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then

@@ -40,9 +40,16 @@ def resolve():
     if build_type == 'release':
         if not TAG_PATTERN.fullmatch(tag):
             raise ValueError('release builds require a vX.Y.Z tag')
-        ref = git_tag_commit(tag)
-        if ref_type == 'tag' and sha and ref != sha:
-            raise ValueError('release tag does not point to the triggering commit')
+        if not re.fullmatch(r'[0-9a-fA-F]{40}', sha):
+            raise ValueError('GITHUB_SHA must be a full commit SHA')
+        if ref_type == 'tag':
+            ref = git_tag_commit(tag)
+            if ref != sha:
+                raise ValueError('release tag does not point to the triggering commit')
+        else:
+            # A manually requested release is built from the selected workflow ref;
+            # the release job creates the version tag at this exact commit.
+            ref = sha
         version = tag[1:]
         channel = 'release'
     else:
