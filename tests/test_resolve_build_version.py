@@ -28,6 +28,7 @@ class ResolveBuildVersionTests(unittest.TestCase):
         self.assertEqual(result['tag'], 'v1.2.3')
         self.assertEqual(result['version'], '1.2.3')
         self.assertEqual(result['channel'], 'release')
+        self.assertEqual(result['artifact'], 'smo2pc-1.2.3-windows-builder')
 
     def test_tag_trigger_still_requires_the_tag_to_match_the_triggering_commit(self):
         commit = 'b' * 40

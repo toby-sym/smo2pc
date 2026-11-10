@@ -4,6 +4,7 @@ type Field = 'prodKeys' | 'titleKeys' | 'base' | 'update'
 type PickedFiles = Record<Field, string>
 type NativeMessage =
   | { type: 'picked'; field: Field; path: string }
+  | { type: 'outputPicked'; path: string; files: PickedFiles }
   | { type: 'log'; text: string }
   | { type: 'buildFinished'; success: boolean; exePath?: string; text: string }
   | { type: 'error'; text: string }
@@ -26,6 +27,11 @@ function App() {
       const message = event.data
       if (message.type === 'picked') {
         setFiles(current => ({ ...current, [message.field]: message.path }))
+      } else if (message.type === 'outputPicked') {
+        setLogs([])
+        setBuilt(false)
+        setBuilding(true)
+        send({ action: 'build', files: message.files, outputPath: message.path })
       } else if (message.type === 'log') {
         setLogs(current => [...current.slice(-999), message.text])
       } else if (message.type === 'buildFinished') {
@@ -48,10 +54,7 @@ function App() {
   const choose = (field: Field) => send({ action: 'pick', field })
   const startBuild = () => {
     if (!files.prodKeys || !files.base || !files.update) return
-    setLogs([])
-    setBuilt(false)
-    setBuilding(true)
-    send({ action: 'build', files })
+    send({ action: 'chooseOutput', files })
   }
 
   const fileCard = (field: Field, title: string, detail: string, required = true) => (
@@ -101,8 +104,8 @@ function App() {
         <div className="privacy-note"><span>🔒</span><p>Keys and game packages are read directly from their selected paths. They are not uploaded or copied into the source repository.</p></div>
 
         <div className="build-row">
-          <div><strong>{building ? 'Build running' : built ? 'Build complete' : 'Ready when you are'}</strong><small>{built ? 'smo_native.exe is ready in build/bin' : 'The first build can take a while; later builds resume.'}</small></div>
-          <button className="primary" disabled={!canBuild} onClick={startBuild}>{building ? <><span className="spinner" /> Building…</> : built ? 'Build again' : 'Build SMO2PC'}</button>
+          <div><strong>{building ? 'Build running' : built ? 'Build complete' : 'Ready when you are'}</strong><small>{built ? 'The executable and required runtime files were saved to your chosen folder.' : 'Choose where to save the executable when you start the build.'}</small></div>
+          <button className="primary" disabled={!canBuild} onClick={startBuild}>{building ? <><span className="spinner" /> Building…</> : built ? 'Build again' : 'Choose output and build'}</button>
         </div>
 
         {(logs.length > 0 || building) && <section className="log-panel"><div className="log-title"><span>BUILD OUTPUT</span><span className={building ? 'live' : ''}>{building ? 'RUNNING' : 'FINISHED'}</span></div><div className="log-box" ref={logBox}>{logs.map((line, index) => <div key={index}>{line}</div>)}{building && <div className="cursor">▍</div>}</div></section>}

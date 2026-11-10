@@ -64,7 +64,7 @@ jobs:
       ref: ${{ needs.prepare.outputs.ref }}
 
   package:
-    name: Windows builder and source bundle
+    name: Windows builder
     needs: [prepare, verify]
     runs-on: windows-latest
     steps:
@@ -87,12 +87,21 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Publish standalone Windows builder
-        run: dotnet publish builder/app/Smo2pc.Builder.csproj --configuration Release --runtime win-x64 --self-contained true --nologo -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugSymbols=false -p:DebugType=None --output artifacts/builder-app
-      - name: Package source and checksum
+      - name: Prepare private embedded build payload
+        shell: pwsh
         env:
           BUILD_VERSION: ${{ needs.prepare.outputs.version }}
-        run: python tools/package-source.py --version $env:BUILD_VERSION --builder-publish artifacts/builder-app
+          BUILDER_SOURCE_ARCHIVE: ${{ runner.temp }}\smo2pc-builder-source.zip
+        run: git archive --format=zip --prefix="smo2pc-$env:BUILD_VERSION/" --output="$env:BUILDER_SOURCE_ARCHIVE" HEAD
+      - name: Publish standalone Windows builder
+        env:
+          BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+          BUILDER_SOURCE_ARCHIVE: ${{ runner.temp }}\smo2pc-builder-source.zip
+        run: dotnet publish builder/app/Smo2pc.Builder.csproj --configuration Release --runtime win-x64 --self-contained true --nologo -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugSymbols=false -p:DebugType=None -p:Version=$env:BUILD_VERSION -p:BuilderSourceArchive=$env:BUILDER_SOURCE_ARCHIVE --output artifacts/builder-app
+      - name: Package app and checksum
+        env:
+          BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+        run: python tools/package-builder.py --version $env:BUILD_VERSION --publish artifacts/builder-app
       - name: Upload versioned build packages
         uses: actions/upload-artifact@v7
         with:
@@ -158,7 +167,7 @@ jobs:
             fi
             echo "Release tag $RELEASE_TAG in $GH_REPO already points to built commit $SOURCE_COMMIT."
           fi
-      - name: Publish versioned build packages
+      - name: Publish Windows builder download
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

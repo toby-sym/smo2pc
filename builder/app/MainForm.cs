@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.IO.Compression;
+using System.Reflection;
 using System.Text.Json;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -57,8 +59,13 @@ internal sealed class MainForm : Form
                 ChooseFile(json.RootElement.GetProperty("field").GetString() ?? "");
                 return;
             }
+            if (action == "chooseOutput")
+            {
+                ChooseOutputLocation(json.RootElement.GetProperty("files"));
+                return;
+            }
             if (action == "build")
-                await BuildAsync(json.RootElement.GetProperty("files"));
+                await BuildAsync(json.RootElement.GetProperty("files"), json.RootElement.GetProperty("outputPath").GetString() ?? "");
         }
         catch (Exception ex)
         {
@@ -82,10 +89,28 @@ internal sealed class MainForm : Form
             Send(new { type = "picked", field, path = dialog.FileName });
     }
 
-    private async Task BuildAsync(JsonElement files)
+    private void ChooseOutputLocation(JsonElement files)
+    {
+        using var dialog = new SaveFileDialog
+        {
+            Title = "Choose where to save the built game",
+            Filter = "Windows executable|*.exe",
+            DefaultExt = "exe",
+            AddExtension = true,
+            OverwritePrompt = true,
+            FileName = "smo_native.exe",
+            InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory)
+        };
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+            Send(new { type = "outputPicked", path = dialog.FileName, files });
+    }
+
+    private async Task BuildAsync(JsonElement files, string outputPath)
     {
         if (_buildRunning)
             return;
+        if (string.IsNullOrWhiteSpace(outputPath) || !outputPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Choose a destination ending in .exe for the built game.");
         var prodKeys = GetPath(files, "prodKeys");
         var titleKeys = GetPath(files, "titleKeys");
         var basePackage = GetPath(files, "base");
@@ -98,9 +123,7 @@ internal sealed class MainForm : Form
         if (!IsPackage(basePackage) || !IsPackage(updatePackage))
             throw new InvalidOperationException("The base game and update must each be an NSP or XCI file.");
 
-        _repoRoot = FindRepositoryRoot();
-        if (_repoRoot is null)
-            throw new DirectoryNotFoundException("Could not find scripts/setup.py beside this builder. Extract the complete Windows builder package before launching it.");
+        _repoRoot = ResolveRepositoryRoot();
 
         _buildRunning = true;
         Send(new { type = "log", text = "Checking the local Python environment…" });
@@ -126,13 +149,56 @@ internal sealed class MainForm : Form
         }
 
         var exitCode = await RunProcessAsync(python, arguments, _repoRoot);
-        var exePath = Path.Combine(_repoRoot, "build", "bin", "smo_native.exe");
-        var success = exitCode == 0 && File.Exists(exePath);
+        var builtExe = Path.Combine(_repoRoot, "build", "bin", "smo_native.exe");
+        var success = exitCode == 0 && File.Exists(builtExe);
         if (success)
-            Send(new { type = "buildFinished", success = true, exePath, text = $"Build complete: {exePath}" });
+        {
+            try
+            {
+                CopyGameToOutput(builtExe, outputPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                success = false;
+                Send(new { type = "log", text = $"Could not save the game to the chosen location: {ex.Message}" });
+            }
+        }
+        if (success)
+            Send(new { type = "buildFinished", success = true, exePath = outputPath, text = $"Build complete: {outputPath}" });
         else
-            Send(new { type = "buildFinished", success = false, exePath = (string?)null, text = $"Build stopped with exit code {exitCode}. Review the output above, fix the missing requirement, and run Build again; completed steps resume." });
+            Send(new { type = "buildFinished", success = false, exePath = (string?)null, text = exitCode == 0
+                ? "The build finished, but the executable could not be saved to the chosen location. Review the output above and try another folder."
+                : $"Build stopped with exit code {exitCode}. Review the output above, fix the missing requirement, and run Build again; completed steps resume." });
         _buildRunning = false;
+    }
+
+    private static void CopyGameToOutput(string builtExe, string outputPath)
+    {
+        var destination = Path.GetFullPath(outputPath);
+        var destinationDirectory = Path.GetDirectoryName(destination)
+            ?? throw new InvalidOperationException("The selected executable path has no parent folder.");
+        Directory.CreateDirectory(destinationDirectory);
+        CopyUnlessSame(builtExe, destination);
+
+        var buildBin = Path.GetDirectoryName(builtExe)!;
+        foreach (var dependency in new[] { "smo_game.dll", "smo_glslang.dll", "SDL3.dll", "WebView2Loader.dll", "shaderc_shared.dll" })
+        {
+            var source = Path.Combine(buildBin, dependency);
+            if (File.Exists(source))
+                CopyUnlessSame(source, Path.Combine(destinationDirectory, dependency));
+        }
+
+        var buildDirectory = Path.GetDirectoryName(buildBin)!;
+        var configPath = Path.ChangeExtension(destination, ".smo2pc");
+        File.WriteAllText(configPath,
+            $"SMO_ROMFS={Path.Combine(buildDirectory, "romfs")}\nSMO_USERDATA={Path.Combine(destinationDirectory, "userdata")}\n",
+            new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+    }
+
+    private static void CopyUnlessSame(string source, string destination)
+    {
+        if (!Path.GetFullPath(source).Equals(Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase))
+            File.Copy(source, destination, overwrite: true);
     }
 
     private static string GetPath(JsonElement files, string name) => files.TryGetProperty(name, out var value) ? value.GetString() ?? "" : "";
@@ -141,7 +207,7 @@ internal sealed class MainForm : Form
         Path.GetExtension(path).Equals(".nsp", StringComparison.OrdinalIgnoreCase) ||
         Path.GetExtension(path).Equals(".xci", StringComparison.OrdinalIgnoreCase);
 
-    private static string? FindRepositoryRoot()
+    private static string ResolveRepositoryRoot()
     {
         var configured = Environment.GetEnvironmentVariable("SMO2PC_REPO_ROOT");
         if (!string.IsNullOrWhiteSpace(configured) && File.Exists(Path.Combine(configured, "scripts", "setup.py")))
@@ -149,7 +215,28 @@ internal sealed class MainForm : Form
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
             if (File.Exists(Path.Combine(directory.FullName, "scripts", "setup.py")))
                 return directory.FullName;
-        return null;
+
+        var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.1.0";
+        var cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "SMO2PC", "Builder", "source", version);
+        var cachedRoot = FindRepositoryRootUnder(cache);
+        if (cachedRoot is not null)
+            return cachedRoot;
+
+        using var sourceArchive = Assembly.GetExecutingAssembly().GetManifestResourceStream("Smo2pc.Builder.Source.zip")
+            ?? throw new InvalidOperationException("This builder package does not contain its local build payload.");
+        Directory.CreateDirectory(cache);
+        ZipFile.ExtractToDirectory(sourceArchive, cache, overwriteFiles: true);
+        return FindRepositoryRootUnder(cache)
+            ?? throw new InvalidDataException("The embedded build payload did not contain scripts/setup.py.");
+    }
+
+    private static string? FindRepositoryRootUnder(string directory)
+    {
+        if (!Directory.Exists(directory))
+            return null;
+        return Directory.EnumerateDirectories(directory)
+            .FirstOrDefault(candidate => File.Exists(Path.Combine(candidate, "scripts", "setup.py")));
     }
 
     private async Task<string?> EnsurePythonAsync(string root)
