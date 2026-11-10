@@ -75,6 +75,26 @@ static volatile LONG g_open_log;
 static CRITICAL_SECTION g_fs_lock;
 static volatile LONG g_fs_lock_ready;
 
+static void output_paths(char rom[MAX_PATH], char user[MAX_PATH]) {
+    char exe[MAX_PATH], config[MAX_PATH], line[MAX_PATH], *slash, *dot;
+    rom[0] = user[0] = 0;
+    DWORD length = GetModuleFileNameA(NULL, exe, sizeof exe);
+    if (!length || length >= sizeof exe) return;
+    slash = strrchr(exe, '\\');
+    if (!slash) slash = strrchr(exe, '/');
+    dot = strrchr(exe, '.');
+    if (dot && (!slash || dot > slash)) *dot = 0;
+    if (snprintf(config, sizeof config, "%s.smo2pc", exe) >= sizeof config) return;
+    FILE *file = fopen(config, "r");
+    if (!file) return;
+    while (fgets(line, sizeof line, file)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (!strncmp(line, "SMO_ROMFS=", 10)) strncpy(rom, line + 10, MAX_PATH - 1);
+        else if (!strncmp(line, "SMO_USERDATA=", 13)) strncpy(user, line + 13, MAX_PATH - 1);
+    }
+    fclose(file);
+}
+
 static void fs_lock(void) {
     if (InterlockedCompareExchange(&g_fs_lock_ready, 1, 0) == 0) { InitializeCriticalSection(&g_fs_lock); g_fs_lock_ready = 2; }
     while (g_fs_lock_ready != 2) SwitchToThread();
@@ -85,8 +105,10 @@ static void fs_unlock(void) { LeaveCriticalSection(&g_fs_lock); }
 static void fs_roots(void) {
     if (g_rom_root[0]) return;
     const char *env = getenv("SMO_ROMFS"), *user = getenv("SMO_USERDATA");
-    strncpy(g_rom_root, env && env[0] ? env : "..\\romfs", MAX_PATH - 1);
-    strncpy(g_user_root, user && user[0] ? user : "..\\userdata", MAX_PATH - 1);
+    char configured_rom[MAX_PATH], configured_user[MAX_PATH];
+    output_paths(configured_rom, configured_user);
+    strncpy(g_rom_root, env && env[0] ? env : configured_rom[0] ? configured_rom : "..\\romfs", MAX_PATH - 1);
+    strncpy(g_user_root, user && user[0] ? user : configured_user[0] ? configured_user : "..\\userdata", MAX_PATH - 1);
     CreateDirectoryA(g_user_root, NULL);
 }
 const char *fs_user_root(void) { fs_roots(); return g_user_root; }
