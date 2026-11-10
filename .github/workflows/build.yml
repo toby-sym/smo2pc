@@ -14,7 +14,7 @@ on:
         default: dev
         options: [dev, release]
       tag_name:
-        description: Existing release tag (vX.Y.Z); leave empty for dev
+        description: Release tag to create (vX.Y.Z); leave empty for dev
         type: string
         required: false
   workflow_call:
@@ -100,6 +100,33 @@ jobs:
         with:
           name: ${{ needs.prepare.outputs.artifact }}
           path: release-assets
+      - name: Create release tag at the built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.ref }}
+        run: |
+          set -euo pipefail
+          tag_commit="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha 2>/dev/null || true)"
+          if [ -n "$tag_commit" ]; then
+            if [ "$tag_commit" != "$SOURCE_COMMIT" ]; then
+              echo "Release tag $RELEASE_TAG already points to a different commit; refusing to move it." >&2
+              exit 1
+            fi
+            echo "Release tag $RELEASE_TAG already points to $SOURCE_COMMIT."
+          else
+            tag_object="$(gh api --method POST "repos/$GH_REPO/git/tags" \
+              -f "tag=$RELEASE_TAG" \
+              -f "message=Release $RELEASE_VERSION" \
+              -f "object=$SOURCE_COMMIT" \
+              -f "type=commit" --jq .sha)"
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" \
+              -f "sha=$tag_object" >/dev/null
+            echo "Created release tag $RELEASE_TAG at $SOURCE_COMMIT."
+          fi
       - name: Publish tagged source bundle
         env:
           GH_TOKEN: ${{ github.token }}
